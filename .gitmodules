@@ -1,0 +1,4 @@
+[submodule "ssl-aggregator"]
+	path = ssl-aggregator
+	url = https://github.com/LimaBR/ssl-aggregator.git
+	branch = main
