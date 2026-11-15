@@ -1,0 +1,29 @@
+# Local configuration and secrets
+.env
+local.properties
+*.jks
+*.keystore
+
+# Android / Gradle
+.gradle/
+android/build/
+android/**/build/
+android/.idea/
+android/captures/
+*.iml
+.externalNativeBuild/
+.cxx/
+
+build/
+compile_commands.json
+
+# Session data (large; kept outside the repository)
+session_*/
+*.mkv
+*.h264
+
+# Editors and OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
