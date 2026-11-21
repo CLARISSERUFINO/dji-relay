@@ -1,0 +1,22 @@
+// Top-level build file. Same layout as SampleCode-V5's android-sdk-v5-as/build.gradle.
+apply from: rootProject.file('dependencies.gradle')
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.7.0'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$KOTLIN_VERSION"
+        // Kotlin 2.x moved the Compose compiler into a Gradle plugin shipped with Kotlin.
+        classpath "org.jetbrains.kotlin:compose-compiler-gradle-plugin:$KOTLIN_VERSION"
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}

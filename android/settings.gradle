@@ -1,0 +1,5 @@
+// Single-module Android project. Structure and versions follow DJI SampleCode-V5
+// (android-sdk-v5-as + android-sdk-v5-sample, MSDK 5.20.1), without UXSDK and the
+// open-pilot modules.
+rootProject.name = 'dji-relay'
+include ':app'

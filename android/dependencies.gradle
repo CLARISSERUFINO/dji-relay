@@ -1,0 +1,29 @@
+// Dependency coordinates, in the style of SampleCode-V5's dependencies.gradle.
+ext {
+    deps = [:]
+
+    // DJI MSDK v5 (same coordinates and version as the sample)
+    deps.aircraft = 'com.dji:dji-sdk-v5-aircraft:5.20.1'
+    deps.aircraftProvided = 'com.dji:dji-sdk-v5-aircraft-provided:5.20.1'
+    deps.networkImp = 'com.dji:dji-sdk-v5-networkImp:5.20.1'
+
+    // Libraries the MSDK uses at runtime that are NOT in the dji-sdk-v5-aircraft POM.
+    // The sample lists them as "sdk 所需" (required by the SDK) in
+    // open-pilot-plugin-sample/build.gradle. Without xcrash, SDKManager.init crashes with
+    // NoClassDefFoundError: xcrash/ICrashCallback.
+    deps.xcrash = 'com.iqiyi.xcrash:xcrash-android-lib:3.1.0'
+    deps.rx3Kt = 'io.reactivex.rxjava3:rxkotlin:3.0.0'
+    deps.documentfile = 'androidx.documentfile:documentfile:1.0.1'
+
+    // Jetpack Compose and AndroidX. Versions chosen to build with compileSdk 35,
+    // AGP 8.7.0 and Kotlin 2.1.0.
+    deps.composeBom = 'androidx.compose:compose-bom:2024.12.01'
+    deps.composeUi = 'androidx.compose.ui:ui'
+    deps.composeUiToolingPreview = 'androidx.compose.ui:ui-tooling-preview'
+    deps.composeUiTooling = 'androidx.compose.ui:ui-tooling'
+    deps.composeMaterial3 = 'androidx.compose.material3:material3'
+    deps.activityCompose = 'androidx.activity:activity-compose:1.9.3'
+    deps.lifecycleRuntimeCompose = 'androidx.lifecycle:lifecycle-runtime-compose:2.8.7'
+    deps.coreKtx = 'androidx.core:core-ktx:1.15.0'
+    deps.coroutinesAndroid = 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0'
+}
