@@ -1,6 +1,6 @@
 # Specification: DJI Mini 3 Pro video and telemetry relay to the PC
 
-Revision 4.3. It replaces the original Portuguese specification.
+Revision 4.4. It replaces the original Portuguese specification.
 
 - Revision 2 recorded the F0 decisions.
 - Revision 3 integrated the existing capture and analysis system, [`ssl-aggregator`](https://github.com/LimaBR/ssl-aggregator).
@@ -8,6 +8,7 @@ Revision 4.3. It replaces the original Portuguese specification.
 - Revision 4.1: the 4K replay becomes conditional on E9. SSL-Vision runs on the same PC as the loggers and still has to be installed (V20).
 - Revision 4.2: corrections from F1, checked with `javap` on 5.20.1 and against SampleCode-V5: the `Application` class, the full `SDKManagerCallback`, `KeyConnection` usage, the accessory filter, the build JDK, and the firmware-version keys (sections 7.1, 7.2, Appendix A). The PC runs Ubuntu 24.04, not 26.04 (sections 4, 6, V20).
 - Revision 4.3: the phone backup becomes a phone recording started and stopped by the user (RF10, 7.10); the live stream to the PC is the primary path. Separate "Live streaming", "Phone recording" and "Drone recording (microSD)" controls (7.11, F3). NFR4 and E6 no longer require a continuous phone backup.
+- Revision 4.4: results of E1 and E2 (F2): Annex B, one access unit per callback, SPS/PPS before every IDR, H.264 High at 1440×1080, SEI as side data only (7.4, V2, V4, V10, V14). RTP timestamp = `pts_ms` × 90; the live-time correction is chosen in F4 (7.5, 10.2, V3, E2). No fixed 1920×1080 assumption: SSL-Vision has no resolution requirement (4, 8.3, 9.1, 11.1, V5, V19, V21).
 
 API names marked *verified* were checked against DJI SampleCode-V5 and the
 signatures in `dji-sdk-v5-aircraft-provided:5.20.1` (Appendix A), or against the
@@ -60,7 +61,7 @@ Two programs:
 
 | Source | Format | Path into SSL-Vision | Use |
 |---|---|---|---|
-| Live video (O3 → app → PC) | 1080p/30 H.264, up to 18 Mb/s | **Live**: `drone_logger` → v4l2loopback → SSL-Vision V4L module (section 9.1) | Ground truth in real time, always on; monitoring; time anchor |
+| Live video (O3 → app → PC) | H.264 at 30 fps; 1440×1080 at about 4 Mb/s measured in F2 (E1), checked again in video mode in F5 | **Live**: `drone_logger` → v4l2loopback → SSL-Vision V4L module (section 9.1) | Ground truth in real time, always on; monitoring; time anchor |
 | microSD recording | 3840×2160, 60 fps, **H.265**, plus `.SRT` if accepted | **Replay after the flight**, conditional (only if E9 shows that live detection is not good enough): MP4 → SSL-Vision Video module (section 9.2) | Higher-resolution ground truth, with exact frame times |
 
 In both paths SSL-Vision publishes the usual detection frames, and `vision_logger`
@@ -197,7 +198,7 @@ and logs the result. That gives three separate bands: O3 on 5.8 GHz, the phone o
 ### 7.3 Receiving the stream (verified)
 
 - Manager: `MediaDataCenter.getInstance().cameraStreamManager`.
-- Camera index: from `addAvailableCameraUpdatedListener` (`onAvailableCameraUpdated(list)`). Expected to be `ComponentIndexType.LEFT_OR_MAIN` **[VERIFY]**. Never hard-code it.
+- Camera index: from `addAvailableCameraUpdatedListener` (`onAvailableCameraUpdated(list)`). It is `ComponentIndexType.LEFT_OR_MAIN` on the Mini 3 Pro (V11, F1). Never hard-code it.
 - `addReceiveStreamListener(index, listener)`, where the listener is `onReceiveStream(data: ByteArray, offset: Int, length: Int, info: StreamInfo)`. Remove it with `removeReceiveStreamListener(listener)`.
 - `StreamInfo`: `getMimeType()` (`MimeType.H264` / `H265`), `getWidth()`, `getHeight()`, `getFrameRate()`, `getPresentationTimeMs()`, `isKeyFrame()`, and **`getSeiList()`** (`List<SEIData>` with `seiType` and `mSeiData`; not in the public docs).
 - Diagnostics only: `getAircraftStreamFrameInfo(index)` → `FrameInfo` (`nalUnitList`, `isAbsoluteFrame`, `mayIllegalFrame`, `frameContentOffset`); `getVideoStreamFormat`, `getMediaFormat`, `setStreamPriority`, `enableStream`.
@@ -215,16 +216,17 @@ No I/O and no large allocations in the callback. **Always copy**: the sample han
 
 ### 7.4 NAL parsing
 
-- Detect Annex B or AVCC automatically (E1) and log it. Confirm whether one callback is one access unit (E1).
+- E1 (F2): the live stream is **Annex B** (4-byte start codes), and **one callback is one access unit**. Each callback is `[non-IDR]` or `[SPS PPS IDR]`; there are no AUD and no SEI NAL units. The parser still checks for a start code and logs an `error` event if a callback does not begin with one.
 - H.264 NAL types: 7 SPS, 8 PPS, 5 IDR, 1 non-IDR, 6 SEI, 9 AUD (AUD is dropped when sending).
-- Cache the latest SPS/PPS and insert them before any IDR that arrives without them.
+- SPS and PPS come before every IDR (V4, E1). The parser still caches the latest SPS/PPS and inserts them before any IDR that arrives without them.
+- The SEI comes only as side data in `StreamInfo.getSeiList()`: one entry of type 240, 25 bytes, per frame (V14, E1). Its format is undocumented; it is sent raw in the `frame` message.
 - If `getMimeType()` reports H265: log a `mime_changed` event and use the RFC 7798 packetizer. It is only implemented if E1 shows that it is needed.
 
 ### 7.5 RTP packetizer (RFC 6184)
 
 - 12-byte header: V=2, PT=96, 16-bit sequence, 90 kHz timestamp, random SSRC fixed for the session, marker bit on the last packet of each access unit.
 - Single NAL unit packets, and FU-A (type 28) for larger NAL units. No STAP-A. Maximum payload 1200 bytes (configurable up to about 1400).
-- **Continuous RTP timestamp:** within a segment, from `presentationTimeMs` if E2 shows it is regular, otherwise from the receive time. After a reconnection, the segment counter increments, and the timestamp is re-anchored so that it stays monotonic. SSRC and sequence continue.
+- **Continuous RTP timestamp:** within a segment, **`pts_ms` × 90** (decided from E2: `presentationTimeMs` is UTC epoch milliseconds and monotonic; it tracks the arrival times within a few ms but is not a fixed-rate encoder clock). After a reconnection, the segment counter increments, and the timestamp is re-anchored so that it stays monotonic. SSRC and sequence continue.
 - **Header extension (RFC 8285, one-byte form, `0xBEDE`)** on the first packet of each access unit:
 
   | ID | Length | Content |
@@ -374,7 +376,7 @@ Changes to `ssl-aggregator` (made in the phases listed, not now):
   2. It is pushed into `appsrc` (caps `application/x-rtp, media=video, clock-rate=90000, encoding-name=H264, payload=96`) → `rtpjitterbuffer` (latency `DRONE_JITTER_LATENCY_MS`, `drop-on-latency=true`) → `rtph264depay` → `h264parse config-interval=-1` → `tee`:
      - **recording:** `matroskamux` → `video_live.mkv` (original bitstream);
      - **decoding:** `DRONE_DECODER` (`nvh264dec`, fallback `avdec_h264`) → `tee`:
-       - **SSL-Vision injection** (on by default, `DRONE_INJECT=1`): `videoconvert` → `video/x-raw, format=YUY2, width=1920, height=1080, framerate=30/1` → `v4l2sink device=$DRONE_V4L2_DEVICE sync=false`. A pad probe before the sink stamps each frame's injection time (`now_rx()`) and its RTP timestamp into `drone.live_frame`;
+       - **SSL-Vision injection** (on by default, `DRONE_INJECT=1`): `videoconvert` → `video/x-raw, format=YUY2` at the live stream's resolution, `framerate=30/1` → `v4l2sink device=$DRONE_V4L2_DEVICE sync=false`. A pad probe before the sink stamps each frame's injection time (`now_rx()`) and its RTP timestamp into `drone.live_frame`;
        - **display** (optional, `DRONE_SHOW_VIDEO`): `videoconvert` → sink with `sync=false`.
 - The pipeline is rebuilt automatically after a stream interruption, but the v4l2loopback device stays open. While no frames arrive, nothing is written, so SSL-Vision simply waits.
 - Optional per-packet log (`DRONE_PACKET_LOG=1`): `rtp_packets.csv` next to the `.mkv`, for experiments E1–E5. It is off by default.
@@ -406,7 +408,7 @@ stored in `drone.config_check`. Accepting 59.94 or 60 fps is a profile option.
 
 ```
 $DRONE_OUTPUT_DIR/<capture_session>/
-  video_live.mkv      # original live bitstream (1080p/30 H.264)
+  video_live.mkv      # original live bitstream (H.264)
   rtp_packets.csv     # only with DRONE_PACKET_LOG=1
   session.json        # effective configuration, versions, SSRC
   DJI_xxxx.MP4        # 4K/60 H.265, copied from the microSD afterwards
@@ -425,13 +427,13 @@ example the ceiling camera indoors), SSL-Vision runs with several camera threads
 ### 9.1 Live injection (v4l2loopback → V4L module)
 
 - The `v4l2loopback` kernel module creates a virtual camera, for example `/dev/video10` (`video_nr=10 card_label="DJI drone" exclusive_caps=1`). `drone_logger` writes decoded frames to it; SSL-Vision reads it like a USB webcam.
-- SSL-Vision settings for that camera thread: capture module **V4L**, `cam idx` = the device number, `width` 1920, `height` 1080, `framerate` 30, `pixel format` **YUYV**.
+- SSL-Vision settings for that camera thread: capture module **V4L**, `cam idx` = the device number, `width` and `height` = the live stream's resolution (SSL-Vision has no requirement on it), `framerate` 30, `pixel format` **YUYV**.
 - Advantages: SSL-Vision needs **no code changes**; the device survives stream interruptions; `drone_logger` knows exactly when each frame was handed over (`inject_*`), which makes the correction in section 10.2 possible.
 - **[VERIFY] V18:**
   - Does the V4L2 buffer timestamp written by `v4l2sink` reach SSL-Vision through v4l2loopback (as `t_capture_camera`)?
   - If it does, `drone_logger` could set it to the frame's estimated capture time, and SSL-Vision would publish it directly.
   - If not, the correction in section 10.2 is done in the analysis.
-- The V4L module opens `/dev/video<cam idx>` (verified in the source). **[VERIFY] V19:** it accepts 1920×1080 YUYV from v4l2loopback.
+- The V4L module opens `/dev/video<cam idx>` (verified in the source). **[VERIFY] V19:** it accepts YUYV at the live resolution from v4l2loopback.
 - Alternative, not chosen: forward the RTP packets to a local port and let SSL-Vision's **Video** module decode them through an OpenCV GStreamer pipeline. It also needs no SSL-Vision change, but `t_capture_camera` would be a synthetic `k/30` value, decoding moves into SSL-Vision, and an interruption ends the capture until it is restarted by hand.
 
 ### 9.2 4K replay after the flight (conditional, F7)
@@ -443,7 +445,7 @@ because they cost little and keep this path open.
 - SSL-Vision's **Video** module opens the MP4 (`cv::VideoCapture`; OpenCV's FFmpeg backend decodes H.265). It sets `t_capture_camera = k / fps` from the start of the file, using the container's frame rate.
 - SSL-Vision processes the file as fast as it can. `t_capture` is then the replay time and is meaningless, but `t_capture_camera` gives the exact frame time within the file.
 - During a replay, `vision_logger` runs with `VISION_SOURCE=replay:<file name>`, so the rows never mix with live data.
-- The replay needs its own SSL-Vision calibration, because pixel coordinates at 4K are twice those at 1080p.
+- The replay needs its own SSL-Vision calibration, because pixel coordinates at 4K differ from those of the live stream.
 
 ### 9.3 Changes to `vision_logger` and the vision tables
 
@@ -468,11 +470,9 @@ family as `rx_wall`), so that Stage 1 can match the LED edges against
 ### 10.2 Live: per-frame correction (analysis)
 
 1. **Phone clock → PC clock:** offset + drift from `drone.clock_beacon` (bias of about 1–3 ms).
-2. **Estimated capture time of each live frame:**
-   - If E2 shows that `pts_ms` comes from the drone's encoder clock, map `pts_ms` to the PC clock through the lower envelope of `(arrival − pts)`.
-   - Otherwise, fit a regular 30 fps grid to the arrival times.
+2. **Estimated capture time of each live frame:** chosen in the F4 analysis. E2 (F2) showed that `pts_ms` is UTC epoch milliseconds that moves with the arrival times (correlation 0.91, sd of `t_rx − pts` about 4 ms), not a fixed-rate encoder clock, and that neither `pts_ms` nor the arrival times fit a regular 30 fps grid. The two options considered before E2 (map `pts_ms` through the lower envelope of `(arrival − pts)`, or fit a regular 30 fps grid) therefore do not apply as they are.
 
-   Either way the result is free of network jitter. The constant part of the latency remains, and Stage 1 absorbs it.
+   The constant part of the latency remains, and Stage 1 absorbs it.
 3. **Match** each SSL-Vision frame (`vision.*`, drone `camera_id`) to a `drone.live_frame` by `t_capture` ≈ `inject_wall` (nearest, within a few ms). Then replace `t_capture` with the estimated capture time.
 4. **Stage 1** as today: the robust linear fit to the LED edges absorbs the remaining offset and any rate error.
 
@@ -497,8 +497,9 @@ matching window. The target is < 0.2 s.
 ### 11.1 Image resolution
 
 At 11 m, with a horizontal field of view of about 74° (16:9 video; **[VERIFY]**
-the real video FOV), one pixel covers about **8.6 mm in the live 1080p** stream
-and about **4.3 mm in 4K**. The dots of the standard SSL pattern are about 40–50 mm
+the real video FOV), one pixel covers about **8.6 mm in a 1920-pixel-wide live** stream
+and about **4.3 mm in 4K**. The live stream measured in F2 is 1440×1080 (4:3); these
+figures are recomputed once F5 fixes the camera mode and E9 measures the real field of view. The dots of the standard SSL pattern are about 40–50 mm
 across. That is about 5 px live, and less in colour, because H.264 halves the
 colour resolution (4:2:0), plus compression artefacts. In 4K it is about 10 px.
 
@@ -549,29 +550,29 @@ drone detections.
 
 | # | Question | How |
 |---|---|---|
-| V2 | Annex B or AVCC? One callback = one access unit? | E1 |
-| V3 | Reference of `presentationTimeMs` | E2 |
-| V4 | SPS/PPS before every IDR? | E1 |
-| V5 | Live stream stays 1080p/30 while recording 4K/60 H.265? | E3 |
+| V2 | Annex B or AVCC? One callback = one access unit? Answered: Annex B; yes | E1 (F2) |
+| V3 | Reference of `presentationTimeMs`. Answered: UTC epoch ms, monotonic, tracks arrival; not a fixed-rate encoder clock. RTP timestamp = `pts_ms` × 90 | E2 (F2) |
+| V4 | SPS/PPS before every IDR? Answered: yes | E1 (F2) |
+| V5 | Live stream keeps its resolution and 30 fps while recording 4K/60 H.265? (1440×1080 measured in F2, camera mode not set; checked again in video mode) | F5, E3 |
 | V7 | Real update rate of the attitude and gimbal keys | `key_rates` |
-| V10 | Codec actually delivered on the live stream | E1 |
-| V11 | Camera index value for the Mini 3 Pro | F1 log |
+| V10 | Codec actually delivered on the live stream. Answered: H.264 High, level 4.0 | E1 (F2) |
+| V11 | Camera index value for the Mini 3 Pro. Answered: `LEFT_OR_MAIN` | F1 log |
 | V12 | `KeyVideoCodecFormat` sets the recording codec | F5, read back + file check |
 | V13 | Subtitles accepted by the Mini 3 Pro, and their time resolution | F5 |
-| V14 | Content of the SEI entries (any capture timestamp?) | E1 |
+| V14 | Content of the SEI entries (any capture timestamp?). Partly answered: side data only, type 240, 25 bytes per frame; format undocumented, no field identified as a capture timestamp | E1 (F2) |
 | V16 | `KeyFrequencyBand` can be set to 5.8 GHz on the Mini 3 Pro in Brazil | F5 |
 | V17 | Latency from `record_started` to the first frame of the 4K file | E3 |
 | V18 | V4L2 buffer timestamp passes through v4l2loopback to SSL-Vision's `t_capture_camera` | E10 |
-| V19 | SSL-Vision's V4L module accepts 1920×1080 YUYV from v4l2loopback (it opens `/dev/video<cam idx>`, verified in the source) | F3 bench |
+| V19 | SSL-Vision's V4L module accepts YUYV at the live resolution from v4l2loopback (it opens `/dev/video<cam idx>`, verified in the source) | F3 bench |
 | V20 | SSL-Vision builds on Ubuntu 24.04 (its install script supports 20.04–24.04; Qt5 packages must exist). Built in `~/PUC/ssl-vision` (`bin/vision` exists); it runs on the same PC as the loggers. Confirmed | Environment setup, before F3 |
-| V21 | Real video field of view of the Mini 3 Pro at 4K and 1080p | E9 (field calibration) |
+| V21 | Real video field of view of the Mini 3 Pro at 4K and at the live resolution | E9 (field calibration) |
 
 ---
 
 ## 14. Tests and acceptance criteria
 
 - **E1 Stream format (bench):** record 60 s of callbacks (bytes + metadata + SEI). *Accept:* decodes with FFmpeg/GStreamer, and the format, NAL layout, SPS/PPS behaviour and codec are documented.
-- **E2 PTS reference:** compare `pts_ms` with `t_rx_ns`. *Accept:* the RTP timestamp mode and the live-time correction method (10.2 step 2) are chosen.
+- **E2 PTS reference:** compare `pts_ms` with `t_rx_ns`. *Accept:* the RTP timestamp mode is chosen, and the live-time correction method (10.2 step 2) is chosen or assigned to a later phase (F2: RTP timestamp = `pts_ms` × 90; correction in F4).
 - **E3 Simultaneous recording:** 10 min of 4K/60 H.265 while relaying. *Accept:* `StreamInfo` stable, live loss < 1 %, 4K file intact, configuration check passes, `record_started` → first-frame latency measured with the LED (V17).
 - **E4 Latency:** glass-to-glass. *Accept:* < 300 ms (p95) to the display.
 - **E5 Network:** 30 min with `robot_logger` and SSL-Vision running. *Accept:* no latency growth; robot loss at baseline (NFR6).
