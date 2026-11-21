@@ -1,12 +1,13 @@
 # Specification: DJI Mini 3 Pro video and telemetry relay to the PC
 
-Revision 4.2. It replaces the original Portuguese specification.
+Revision 4.3. It replaces the original Portuguese specification.
 
 - Revision 2 recorded the F0 decisions.
 - Revision 3 integrated the existing capture and analysis system, [`ssl-aggregator`](https://github.com/LimaBR/ssl-aggregator).
 - Revision 4 records decisions D6 (repository layout) and D7 (SSL-Vision processes the drone video, always live).
 - Revision 4.1: the 4K replay becomes conditional on E9. SSL-Vision runs on the same PC as the loggers and still has to be installed (V20).
 - Revision 4.2: corrections from F1, checked with `javap` on 5.20.1 and against SampleCode-V5: the `Application` class, the full `SDKManagerCallback`, `KeyConnection` usage, the accessory filter, the build JDK, and the firmware-version keys (sections 7.1, 7.2, Appendix A). The PC runs Ubuntu 24.04, not 26.04 (sections 4, 6, V20).
+- Revision 4.3: the phone backup becomes a phone recording started and stopped by the user (RF10, 7.10); the live stream to the PC is the primary path. Separate "Live streaming", "Phone recording" and "Drone recording (microSD)" controls (7.11, F3). NFR4 and E6 no longer require a continuous phone backup.
 
 API names marked *verified* were checked against DJI SampleCode-V5 and the
 signatures in `dji-sdk-v5-aircraft-provided:5.20.1` (Appendix A), or against the
@@ -130,7 +131,7 @@ events and clock beacons.
 - **RF7** Point the gimbal to −90° (nadir) from the app UI.
 - **RF8** One-way clock beacons (section 7.8).
 - **RF9** Live video for the pilot, without disturbing the relay. The screen stays on for the whole session.
-- **RF10** Local backup on the phone: raw bitstream and all messages.
+- **RF10** Phone recording: the app saves the received bitstream and every message on the phone. It starts and stops only on the user's command, and it never interrupts the live stream.
 - **RF11** `drone_logger` checks the reported configuration against the expected profile in `.env` and warns the user about any mismatch.
 - **RF12** `drone_logger` writes PostgreSQL schema `drone` following the `ssl-aggregator` conventions, so `export.sh`, Grafana and the analysis can use it.
 - **RF13** `drone_logger` **injects the decoded live video into SSL-Vision continuously** through a v4l2loopback device, whenever it runs (indoors and outdoors). It logs the injection time of every frame.
@@ -141,7 +142,7 @@ events and clock beacons.
 - **NFR1 Latency:** callback → `sendto` of the frame's last packet < 5 ms (p95). Camera → PC: target < 300 ms (p95). RTP arrival → injected into v4l2loopback: < 20 ms (p95).
 - **NFR2** The SDK callback never blocks: it copies the bytes and returns.
 - **NFR3** Live-frame loss < 1 % with the AP at 10–20 m.
-- **NFR4** If the PC or the network disappears, the app keeps receiving and writing its backup, and resumes sending on its own. `drone_logger` tolerates a database that is temporarily unavailable. The v4l2loopback device stays open across stream interruptions, so SSL-Vision does not need restarting.
+- **NFR4** If the PC or the network disappears, the app keeps receiving and resumes sending on its own. `drone_logger` tolerates a database that is temporarily unavailable. The v4l2loopback device stays open across stream interruptions, so SSL-Vision does not need restarting.
 - **NFR5** 30 continuous minutes with no memory growth and no latency growth.
 - **NFR6** Robot loss (`robot_logger`'s `lost=`) stays at its baseline of about 1 % while the drone flies.
 
@@ -207,10 +208,10 @@ and logs the result. That gives three separate bands: O3 on 5.8 GHz, the phone o
 **Callback rules:**
 1. Stamp `SystemClock.elapsedRealtimeNanos()`.
 2. Copy `data[offset, offset+length)` into a buffer from a pre-allocated pool.
-3. Enqueue it in a bounded queue (about 1 s).
+3. Enqueue it in the bounded queue (about 1 s) of each active consumer: the live sender (F3) and, while it runs, the phone recording (7.10). Each consumer has its own queue, so a slow one never delays the other.
 4. Return.
 
-No I/O and no large allocations in the callback. **Always copy**: the sample hands `data` to another thread without copying. **Never drop the first callback**: the sample does, and it may carry SPS/PPS. When the queue is full, drop frames until the next keyframe and emit a `drop` event.
+No I/O and no large allocations in the callback. **Always copy**: the sample hands `data` to another thread without copying. **Never drop the first callback**: the sample does, and it may carry SPS/PPS. When a consumer's queue is full, that consumer drops frames until the next keyframe and emits a `drop` event.
 
 ### 7.4 NAL parsing
 
@@ -294,19 +295,30 @@ timeout, and failures are logged and shown.
 - Gimbal: `GimbalKey.KeyRotateByAngle` with `GimbalAngleRotation(mode = ABSOLUTE_ANGLE, pitch = −90.0, rollIgnored = true, yawIgnored = true, duration ≈ 1 s)`.
 - The preset is edited and persisted in the app.
 
-### 7.10 Local backup
+### 7.10 Phone recording
 
-Per session, in a folder named with the UTC date and time:
-- `.h264` (Annex B);
-- `.jsonl` with every message, including SEI payloads (base64);
-- a dedicated writer thread.
+The live stream to the PC is the primary path; the PC records the session. The
+phone recording is a separate copy, used for the stream-format tests (E1, E2) and
+for debugging.
 
-Expect about 4 GB per 30 min.
+- Started and stopped only by the user ("Phone recording" control). Independent of
+  the "Live streaming" toggle and of the drone's microSD recording.
+- Each recording goes in its own folder, named with the UTC date and time, in the
+  app-specific storage (`Android/data/com.rufino.djirelay/files/sessions/`), and is
+  copied to the PC with `adb pull`:
+  - `stream.h264`: the callback bytes exactly as received (the format is confirmed
+    in E1);
+  - `messages.jsonl`: one `frame` message per callback, with `file_offset` into
+    `stream.h264` and the SEI payloads (base64), plus the events.
+- Its own bounded queue and a dedicated writer thread. The live path never waits
+  for it: if the recording queue is full, only the recording drops frames and
+  writes a `drop` event.
+- Recording does not start when the free space is too low.
 
 ### 7.11 UI (Compose)
 
 - **Status:** SDK registered, drone connected, O3 band, codec/resolution/fps, send rate, frames/s, drops, recording, microSD free space, battery, GPS, height, subtitles accepted.
-- **Controls:** start/stop relay, start/stop recording, apply and edit the preset, gimbal nadir, PC IP, pilot view on/off.
+- **Controls:** "Live streaming" on/off (relay to the PC), "Phone recording" start/stop (7.10), "Drone recording (microSD)" start/stop, apply and edit the preset, gimbal nadir, PC IP, pilot view on/off.
 - **Alerts:** low battery, link loss, PC unreachable.
 - The screen is kept on for the whole session. The app never sends flight commands.
 
@@ -563,7 +575,7 @@ drone detections.
 - **E3 Simultaneous recording:** 10 min of 4K/60 H.265 while relaying. *Accept:* `StreamInfo` stable, live loss < 1 %, 4K file intact, configuration check passes, `record_started` → first-frame latency measured with the LED (V17).
 - **E4 Latency:** glass-to-glass. *Accept:* < 300 ms (p95) to the display.
 - **E5 Network:** 30 min with `robot_logger` and SSL-Vision running. *Accept:* no latency growth; robot loss at baseline (NFR6).
-- **E6 Robustness:** kill `drone_logger`, stop PostgreSQL, power off the AP, power-cycle the drone. *Accept:* the app resumes on its own, the phone backup is continuous, segments are marked, no database rows are lost, and SSL-Vision resumes detecting without being restarted.
+- **E6 Robustness:** kill `drone_logger`, stop PostgreSQL, power off the AP, power-cycle the drone. *Accept:* the app resumes on its own, segments are marked, no database rows are lost, and SSL-Vision resumes detecting without being restarted.
 - **E7 Clock:** residual of the beacon fit (lower envelope) < 2 ms over 30 min.
 - **E8 Field:** flight at the chosen height over the track, with the robot and the static reference patterns. *Accept:* every table and file in sections 8.4 and 8.6 complete; robot loss at baseline; the time maps of section 10 within ±0.5 s; Stage 1 converges on the drone's LED edges (live; and replayed too, if F7 was done).
 - **E9 SSL-Vision on the drone:** at two or three heights, live through the virtual camera. Compare with the same flight's 4K file opened by hand in SSL-Vision's Video module, which needs no new code. *Accept:* documented detection rates of the robot and of the LED-as-ball, and the position noise of a static pattern. The height and the marker size are chosen from these results. **Decision point:** if live detection is not good enough at any practical height and marker size, phase F7 is done.
@@ -586,8 +598,8 @@ Prerequisites outside the code:
 |---|---|---|
 | F0 | Plan, decisions, this document | done |
 | F1 | Android project from the sample, registration, connection, Compose UI with pilot view, screen kept on. `ssl-aggregator` added as a submodule | Stable connection; V11 |
-| F2 | Stream listener + local backup with per-callback metadata and SEI | E1, E2 |
-| F3 | NAL parser, RTP packetizer + extension, unicast sender. `drone_logger` video path: unicast receiver in `libcommon`, frame assembly, pipeline with `.mkv`, **v4l2loopback injection**, display, optional packet CSV. SSL-Vision reading the virtual camera. `docs/protocol.md` | E4, E10, V19 |
+| F2 | Stream listener + phone recording (user start/stop, 7.10) with per-callback metadata and SEI | E1, E2 |
+| F3 | NAL parser, RTP packetizer + extension, unicast sender, "Live streaming" toggle. `drone_logger` video path: unicast receiver in `libcommon`, frame assembly, pipeline with `.mkv`, **v4l2loopback injection**, display, optional packet CSV. SSL-Vision reading the virtual camera. `docs/protocol.md` | E4, E10, V19 |
 | F4 | Telemetry, events, clock beacons. `drone_logger`: schema `drone`, batch writers, configuration check. `vision_logger`: `t_capture_camera`, `capture_session`, `source`. Grafana panels, `export.sh`. Analysis: beacon fit and live-frame correction (10.2) | E7 |
 | F5 | Drone configuration state machine (O3 band, H.265, 4K/60, exposure, WB, colour, subtitles), recording, gimbal | E3 |
 | F6 | Foreground service, locks, network callbacks, reconnection, final UI | E5, E6, E9, then E8 |
