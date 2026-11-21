@@ -1,7 +1,5 @@
 # DJI Mini 3 Pro video and telemetry relay
 
-> **Status:** design (F0) complete. Implementation starts with phase F1. No code yet.
-
 This project turns a DJI Mini 3 Pro into a ground-truth camera for the UGV
 terrain-traversability work (Fuzzy Logic and Deep Learning courses, PUC-Rio).
 The drone hovers in nadir over the test track while the robot runs.
@@ -16,7 +14,7 @@ pipeline.
 | Program | Runs on | Language | Role |
 |---|---|---|---|
 | Android app (`android/`, this repository) | Phone on the RC-N1 controller (Galaxy S25, Android 15) | Kotlin + DJI MSDK 5.20.1, Jetpack Compose | Receives the encoded H.264 live stream from the MSDK and relays it to the PC over RTP/UDP **without decoding or re-encoding**. Also sends per-frame metadata, drone telemetry, events and clock beacons. Configures the drone (4K/60 H.265 recording on the microSD, O3 radio band, gimbal in nadir). |
-| `drone_logger` (planned inside `ssl-aggregator`) | Ubuntu 26.04 workstation, wired to the AP | C++23 + GStreamer, CMake, PostgreSQL | A third logger next to `robot_logger` and `vision_logger`, with the same conventions. It saves the original live bitstream to `.mkv`, **decodes it and injects it live into SSL-Vision** through a v4l2loopback virtual camera, writes frames, telemetry, events and clock beacons to schema `drone`, checks the reported configuration, and can display the video. |
+| `drone_logger` (planned inside `ssl-aggregator`) | Ubuntu 24.04 workstation, wired to the AP | C++23 + GStreamer, CMake, PostgreSQL | A third logger next to `robot_logger` and `vision_logger`, with the same conventions. It saves the original live bitstream to `.mkv`, **decodes it and injects it live into SSL-Vision** through a v4l2loopback virtual camera, writes frames, telemetry, events and clock beacons to schema `drone`, checks the reported configuration, and can display the video. |
 
 Data flows in one direction only: **phone → PC**. The phone owns every drone
 setting. The PC only checks that the incoming data matches the expected

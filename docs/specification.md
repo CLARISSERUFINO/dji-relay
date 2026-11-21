@@ -1,11 +1,12 @@
 # Specification: DJI Mini 3 Pro video and telemetry relay to the PC
 
-Revision 4.1. It replaces the original Portuguese specification.
+Revision 4.2. It replaces the original Portuguese specification.
 
 - Revision 2 recorded the F0 decisions.
 - Revision 3 integrated the existing capture and analysis system, [`ssl-aggregator`](https://github.com/LimaBR/ssl-aggregator).
 - Revision 4 records decisions D6 (repository layout) and D7 (SSL-Vision processes the drone video, always live).
 - Revision 4.1: the 4K replay becomes conditional on E9. SSL-Vision runs on the same PC as the loggers and still has to be installed (V20).
+- Revision 4.2: corrections from F1, checked with `javap` on 5.20.1 and against SampleCode-V5: the `Application` class, the full `SDKManagerCallback`, `KeyConnection` usage, the accessory filter, the build JDK, and the firmware-version keys (sections 7.1, 7.2, Appendix A). The PC runs Ubuntu 24.04, not 26.04 (sections 4, 6, V20).
 
 API names marked *verified* were checked against DJI SampleCode-V5 and the
 signatures in `dji-sdk-v5-aircraft-provided:5.20.1` (Appendix A), or against the
@@ -96,7 +97,7 @@ the phone.
    │                                                                                     │
    │        AP: 5 GHz ch. 36/80 MHz (phone) + 2.4 GHz (robot ESP8266), with internet     │
    │                                                                                     v
-   │        PC Ubuntu 26.04 (Ethernet) — ssl-aggregator
+   │        PC Ubuntu 24.04 (Ethernet) — ssl-aggregator
    │         ├─ drone_logger (new)
    │         │    :5600 → appsrc → jitterbuffer → depay → parse ─┬─> video_live.mkv
    │         │                                                   └─> nvh264dec ─┬─> v4l2sink /dev/videoN ─┐
@@ -153,7 +154,7 @@ events and clock beacons.
 | Drone | DJI Mini 3 Pro (supported by MSDK 5.20.1; check the firmware against the release notes) |
 | Controller | DJI RC-N1 (RC231). The DJI RC with a built-in screen is not supported by the MSDK |
 | Phone | Samsung Galaxy S25, Android 15, dedicated to this job, mobile data off |
-| PC | Ubuntu 26.04, RTX 5080, **Ethernet** to the AP, fixed IP (DHCP reservation). Runs SSL-Vision, the loggers and PostgreSQL |
+| PC | Ubuntu 24.04, RTX 5080, **Ethernet** to the AP, fixed IP (DHCP reservation). Runs SSL-Vision, the loggers and PostgreSQL |
 | Robot | ESP8266 on the **same AP, 2.4 GHz**; multicast `239.0.0.1:10001` |
 | AP | Dual-band, with internet. **5 GHz: channel 36, 80 MHz, no DFS**, for the phone. Not 149–161 (overlaps the drone's 5.8 GHz band). **2.4 GHz** kept on, for the robot only |
 | DJI app | Package name **`com.rufino.djirelay`**, App Key from developer.dji.com (see README) |
@@ -171,11 +172,14 @@ and logs the result. That gives three separate bands: O3 on 5.8 GHz, the phone o
 
 ### 7.1 Base project (verified against SampleCode-V5)
 
-- MSDK **5.20.1**: `implementation com.dji:dji-sdk-v5-aircraft`, `compileOnly com.dji:dji-sdk-v5-aircraft-provided`, `runtimeOnly com.dji:dji-sdk-v5-networkImp`.
-- AGP 8.7.0, Gradle 8.12, Kotlin 2.1.0, NDK 28.0.13004108, compileSdk/targetSdk 35, minSdk 24, `abiFilters 'arm64-v8a'`.
-- The `Application` extends `DJIApplication` and calls `com.cySdkyc.clx.Helper.install(this)` in `attachBaseContext`.
-- `packagingOptions`: copy the `doNotStrip` list and `pickFirst 'lib/arm64-v8a/libc++_shared.so'` from the sample. Set `android:extractNativeLibs="true"`.
-- Manifest: meta-data `com.dji.sdk.API_KEY` = `${API_KEY}` (from `manifestPlaceholders`). The key comes from `DJI_API_KEY` in `~/.gradle/gradle.properties` and is never committed. Add `uses-feature android.hardware.usb.accessory`, and a USB-attach activity with `USB_ACCESSORY_ATTACHED` and `@xml/accessory_filter`.
+- MSDK **5.20.1**: `implementation com.dji:dji-sdk-v5-aircraft`, `compileOnly com.dji:dji-sdk-v5-aircraft-provided`, `runtimeOnly com.dji:dji-sdk-v5-networkImp`. `networkImp` is already a dependency in the `dji-sdk-v5-aircraft` POM, and the main sample module does not declare it; it is declared explicitly anyway.
+- **Runtime libraries missing from the MSDK POM** (found in F1): the SDK needs `com.iqiyi.xcrash:xcrash-android-lib:3.1.0`, `io.reactivex.rxjava3:rxkotlin:3.0.0` and `androidx.documentfile:documentfile:1.0.1`, which the sample lists as "required by the SDK" in `open-pilot-plugin-sample/build.gradle`. Without xcrash, `SDKManager.init` crashes with `NoClassDefFoundError: xcrash/ICrashCallback`.
+- **Implement every method of MSDK listener interfaces, including those marked `default`** in the provided jar. The runtime classes loaded by `Helper.install` declare some of them abstract: `AvailableCameraUpdatedListener.onCameraStreamEnableUpdate` throws `AbstractMethodError` if it is not overridden (found in F1).
+- AGP 8.7.0, Gradle 8.12, Kotlin 2.1.0, NDK 28.0.13004108, compileSdk/targetSdk 35, minSdk 24, `abiFilters 'arm64-v8a'`. Gradle build files in **Groovy**, with the sample's layout (`dependencies.gradle` with `ext.deps`, SDK versions in `gradle.properties`).
+- **Build JDK:** Gradle 8.12 runs on Java 17–23. Android Studio's bundled JBR is Java 25 (`Unsupported class file major version 69`), and a JRE has no compiler (`does not provide the required capabilities: [JAVA_COMPILER]`). Use a full JDK 21 (`openjdk-21-jdk`), set as `org.gradle.java.home` in `~/.gradle/gradle.properties` and as the Gradle JDK in Android Studio (see `docs/dev-environment.md`).
+- The `Application` is a plain `android.app.Application` subclass (`RelayApplication`). In the sample, `DJIApplication` is a class of the sample itself, not of the SDK. It calls `com.cySdkyc.clx.Helper.install(this)` in `attachBaseContext` (before any MSDK class is used) and initialises the SDK in `onCreate`.
+- `packagingOptions`: copy the `doNotStrip` list and `pickFirst 'lib/arm64-v8a/libc++_shared.so'` from the sample. Set `android:extractNativeLibs="true"`, and also `jniLibs { useLegacyPackaging true }` (the AGP 8 form used by the 5.20.1 open-pilot-plugin-sample).
+- Manifest: meta-data `com.dji.sdk.API_KEY` = `${API_KEY}` (from `manifestPlaceholders`). The key comes from `DJI_API_KEY` in `~/.gradle/gradle.properties` and is never committed; the build fails with an explicit message if it is missing. Add `uses-feature android.hardware.usb.accessory`, and a USB-attach activity with `USB_ACCESSORY_ATTACHED` and `@xml/accessory_filter`. That XML file is **provided by the MSDK AAR** (DJI accessory models `T600`, `HG210`, `WM160`, `com.dji.logiclink`, `com.dji.link`); the app does not define its own.
 - **No UXSDK.** UI in **Jetpack Compose**. The video goes in a `SurfaceView` hosted with `AndroidView`.
 - Packages: `sdk/`, `stream/`, `rtp/`, `net/`, `telemetry/`, `camera/`, `storage/`, `ui/`, `service/`.
 
@@ -183,9 +187,9 @@ and logs the result. That gives three separate bands: O3 on 5.8 GHz, the phone o
 
 1. `SDKManager.getInstance().init(context, InitSettings(SDKLinKMode.LOCAL), SDKManagerCallback)`.
 2. In `onInitProcess(event, total)`, when `event == DJISDKInitEvent.INITIALIZE_COMPLETE`, call `SDKManager.getInstance().registerApp()`.
-3. Callbacks: `onRegisterSuccess`, `onRegisterFailure(IDJIError)`, `onProductConnect(productId)`, `onProductDisconnect(productId)`, `onProductChanged`.
-4. As in the sample, call `registerApp()` again when `DJINetworkManager` reports that the network is available and the app is not yet registered.
-5. Product connection: `FlightControllerKey.KeyConnection` (Boolean).
+3. `SDKManagerCallback` has nine abstract methods, all of which must be implemented: `onRegisterSuccess`, `onRegisterFailure(IDJIError)`, `onProductConnect(productId)`, `onProductDisconnect(productId)`, `onProductChanged(productId)`, `onInitProcess(DJISDKInitEvent, int)`, `onDatabaseDownloadProgress(long, long)` (deprecated), `onRemoteServerStateUpdated(ServerState)` and `onRemoteServerCompatibleError(IDJIError)`. The last three belong to DJI Open Pilot and are only logged.
+4. As in the sample, call `registerApp()` again when `DJINetworkManager.addNetworkStatusListener` (`isNetworkAvailable(boolean)`) reports that the network is available and the app is not yet registered.
+5. Product connection: `FlightControllerKey.KeyConnection` (Boolean). It is a `DJIKeyInfo<Boolean>`: create the key with `KeyTools.createKey(...)` and subscribe with `KeyManager.getInstance().listen(key, holder, getOnce = true, listener)`. Also subscribed from F1 and logged: `ProductKey.KeyProductType`, `ProductKey.KeyFirmwareVersion` (aircraft firmware), `RemoteControllerKey.KeyConnection`, `RemoteControllerKey.KeyFirmwareVersion` and `RemoteControllerKey.KeyFirmwareMatchType` (the aircraft family the controller firmware is built for, e.g. `DJI_MINI_3_PRO`; it returned `UNKNOWN` with the Mini 3 Pro and RC-N1 in F1).
 6. Only after connection: subscribe to telemetry, add the stream listeners, and enable the configuration UI.
 7. On disconnection: remove listeners, cancel key subscriptions, and emit `reconnect` when the drone comes back.
 
@@ -547,7 +551,7 @@ drone detections.
 | V17 | Latency from `record_started` to the first frame of the 4K file | E3 |
 | V18 | V4L2 buffer timestamp passes through v4l2loopback to SSL-Vision's `t_capture_camera` | E10 |
 | V19 | SSL-Vision's V4L module accepts 1920×1080 YUYV from v4l2loopback (it opens `/dev/video<cam idx>`, verified in the source) | F3 bench |
-| V20 | SSL-Vision builds on Ubuntu 26.04 (its install script only supports 20.04–24.04; Qt5 packages must exist). It runs on the same PC as the loggers and is not installed yet | Environment setup, before F3 |
+| V20 | SSL-Vision builds on Ubuntu 24.04 (its install script supports 20.04–24.04; Qt5 packages must exist). Built in `~/PUC/ssl-vision` (`bin/vision` exists); it runs on the same PC as the loggers. Confirmed | Environment setup, before F3 |
 | V21 | Real video field of view of the Mini 3 Pro at 4K and 1080p | E9 (field calibration) |
 
 ---
@@ -600,6 +604,40 @@ The key fields are declared in the superclasses `DJICameraKey`, `DJIGimbalKey`,
 `CameraKey` and the other public key classes, which are thin.
 
 ```
+com.cySdkyc.clx.Helper (in the dji-sdk-v5-aircraft AAR)
+  static void install(Application)
+
+SDKManager.getInstance(): init(Context, InitSettings, SDKManagerCallback), registerApp(),
+  isRegistered(), getSDKVersion(), destroy()
+InitSettings(SDKLinKMode)            SDKLinKMode.LOCAL
+DJISDKInitEvent: START_TO_INITIALIZE, INITIALIZE_COMPLETE
+
+SDKManagerCallback (all abstract)
+  onRegisterSuccess(); onRegisterFailure(IDJIError)
+  onProductDisconnect(int); onProductConnect(int); onProductChanged(int)
+  onInitProcess(DJISDKInitEvent, int); onDatabaseDownloadProgress(long, long)
+  onRemoteServerStateUpdated(dji.open.pilot.client.manager.ServerState)
+  onRemoteServerCompatibleError(IDJIError)
+IDJIError: errorType(), errorCode(), innerCode(), hint(), description()
+
+DJINetworkManager.getInstance().addNetworkStatusListener(IDJINetworkStatusListener)
+IDJINetworkStatusListener: void isNetworkAvailable(boolean)
+
+KeyTools.createKey(DJIKeyInfo<T>) : DJIKey<T>
+CommonCallbacks.KeyListener<T>: void onValueChange(T oldValue, T newValue)
+ProductKey: KeyConnection (Boolean), KeyProductType (ProductType, includes DJI_MINI_3_PRO),
+  KeyFirmwareVersion (String), KeySerialNumber (String)
+RemoteControllerKey: KeyConnection (Boolean), KeyFirmwareVersion (String),
+  KeyFirmwareMatchType (FirmwareMatchType enum: RC_N1_MAVIC_3, DJI_MINI_3_PRO, ...),
+  KeySerialNumber (String)
+FlightControllerKey: KeyFirmwareVersion (String), KeyWholeDeviceFirmwareVersion (String)
+Kotlin extensions in the provided jar (not UXSDK): dji.v5.et.create / listen / get / set
+
+ICameraStreamManager.AvailableCameraUpdatedListener
+  void onAvailableCameraUpdated(List<ComponentIndexType>)
+  default void onCameraStreamEnableUpdate(Map<ComponentIndexType, Boolean>)
+ICameraStreamManager.ScaleType: FIX_XY, CENTER_CROP, CENTER_INSIDE
+
 ICameraStreamManager.ReceiveStreamListener
   void onReceiveStream(byte[] data, int offset, int length, StreamInfo info)
 

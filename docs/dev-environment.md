@@ -1,6 +1,17 @@
 # Development environment
 
-One Ubuntu 26.04 workstation hosts both toolchains:
+One Ubuntu workstation hosts both toolchains. The workstation currently runs
+**Ubuntu 24.04 LTS** (24.04.5), and this guide is written for it. Steps that differ
+from the Ubuntu defaults on 24.04 are marked **(24.04)**: GCC 14 as an extra compiler,
+libpqxx 7.10 built from source, and the JDK used by Gradle.
+
+All repositories live under `~/PUC/`:
+
+| Path | What |
+|---|---|
+| `~/PUC/dji-relay` | This repository, with the `ssl-aggregator` submodule |
+| `~/PUC/ssl-vision` | SSL-Vision |
+| `~/PUC/libpqxx` | libpqxx source, built and installed to `/usr/local` (section 3.1) |
 
 | Purpose | Tool |
 |---|---|
@@ -15,8 +26,9 @@ One Ubuntu 26.04 workstation hosts both toolchains:
 
 Versions pinned by the DJI sample (SampleCode-V5, MSDK 5.20.1): Android Gradle
 Plugin 8.7.0, Gradle 8.12, Kotlin 2.1.0, NDK 28.0.13004108, compileSdk/targetSdk 35,
-minSdk 24, ABI `arm64-v8a` only. AGP 8 needs **JDK 17 or newer**. The JDK that comes
-with Android Studio is fine.
+minSdk 24, ABI `arm64-v8a` only. Gradle 8.12 must run on a **full JDK 17–23**. The JDK
+that comes with current Android Studio (JBR 25) is too new for Gradle 8.12, and
+Ubuntu's default `java` is only a runtime (JRE). Section 6 installs JDK 21.
 
 Each step below says what to run and why. Run the commands one at a time and read
 the output before moving on.
@@ -37,7 +49,7 @@ sudo apt install -y git curl build-essential cmake ninja-build pkg-config gdb
 
 Check the versions. CMake must be 3.20 or newer. GCC must be **14 or newer**,
 because `ssl-aggregator` is built as C++23 (`std::print`, `std::format`,
-`std::jthread`). The default GCC on 26.04 meets this.
+`std::jthread`).
 
 ```bash
 cmake --version
@@ -46,6 +58,37 @@ cmake --version
 ```bash
 g++ --version
 ```
+
+### 1.1 GCC 14 (24.04)
+
+The default `g++` on Ubuntu 24.04 is GCC 13, which lacks `std::print`. Install GCC 14
+next to it. The default compiler stays GCC 13, so every C++23 build must ask for
+`g++-14` explicitly.
+
+1. Install it:
+
+   ```bash
+   sudo apt install -y g++-14
+   ```
+
+2. Check it (expect `14.2`):
+
+   ```bash
+   g++-14 --version
+   ```
+
+3. **Command line:** pass the compiler when a build directory is configured for the
+   first time. CMake remembers it in `build/CMakeCache.txt` (`CMAKE_CXX_COMPILER`), so
+   later builds use it too. To switch compilers, delete the build directory first:
+
+   ```bash
+   cmake -S . -B build -DCMAKE_CXX_COMPILER=g++-14
+   ```
+
+4. **VS Code (CMake Tools):** open the Command Palette (`Ctrl+Shift+P`), run
+   **CMake: Scan for Kits**, then **CMake: Select a Kit** and choose
+   **GCC 14.2.0 x86_64-linux-gnu**, not GCC 13.3.0. The kit is saved per workspace. The
+   status bar shows the active kit.
 
 ---
 
@@ -87,12 +130,58 @@ it. Section 3 shows how to check.
 - `gstreamer1.0-tools`: `gst-launch-1.0` and `gst-inspect-1.0` for testing.
 - `ffmpeg`: provides `ffprobe` and `ffplay`, used to analyse the captures of experiment E1.
 - `nlohmann-json3-dev`: header-only JSON library, used to parse the phone's messages.
-- `libpqxx-dev`: the PostgreSQL C++ client, already required by `ssl-aggregator`. It pulls in `libpq-dev`.
+- `libpq-dev`: the PostgreSQL C client library. libpqxx, the C++ client `ssl-aggregator` uses, is built on top of it from source (section 3.1).
 - `protobuf-compiler` and `libprotobuf-dev`: required to build `ssl-aggregator`'s `vision_logger`.
 
 ```bash
-sudo apt install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-tools ffmpeg nlohmann-json3-dev libpqxx-dev protobuf-compiler libprotobuf-dev
+sudo apt install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-tools ffmpeg nlohmann-json3-dev libpq-dev protobuf-compiler libprotobuf-dev
 ```
+
+### 3.1 libpqxx 7.10 from source, in C++23 (24.04)
+
+`ssl-aggregator` uses libpqxx 7.10 (its README describes a 7.10 exit-time issue that
+the loggers work around with `std::quick_exit`). Ubuntu 24.04's `libpqxx-dev` is
+7.8.1, so **do not install `libpqxx-dev` from apt**. Build 7.10.7 instead, with the same
+compiler (`g++-14`) and C++ standard (23) as `ssl-aggregator`, so the library and the
+loggers agree on the C++ standard library features they use.
+
+1. Get the source at tag `7.10.7`:
+
+   ```bash
+   git clone --branch 7.10.7 --depth 1 https://github.com/jtv/libpqxx.git ~/PUC/libpqxx
+   ```
+
+2. Configure a shared Release build with GCC 14 and C++23, without the library's own tests:
+
+   ```bash
+   cmake -S ~/PUC/libpqxx -B ~/PUC/libpqxx/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_CXX_STANDARD=23 -DBUILD_SHARED_LIBS=ON -DSKIP_BUILD_TEST=ON
+   ```
+
+3. Build it:
+
+   ```bash
+   cmake --build ~/PUC/libpqxx/build -j
+   ```
+
+4. Install it to `/usr/local` (the default prefix), then refresh the dynamic linker cache:
+
+   ```bash
+   sudo cmake --install ~/PUC/libpqxx/build
+   ```
+
+   ```bash
+   sudo ldconfig
+   ```
+
+5. Check that `pkg-config`, which `ssl-aggregator`'s CMake uses, finds 7.10.7 in `/usr/local`:
+
+   ```bash
+   pkg-config --modversion libpqxx
+   ```
+
+   ```bash
+   pkg-config --variable=prefix libpqxx
+   ```
 
 Checks:
 
@@ -167,33 +256,33 @@ and `drone_logger` lives inside it. Clone both at once (replace the URL with thi
 repository's):
 
 ```bash
-git clone --recurse-submodules <this repository's URL> ~/dji-relay
+git clone --recurse-submodules <this repository's URL> ~/PUC/dji-relay
 ```
 
 Then set two git options once, so that `git pull` also updates the submodule and
 `git push` also pushes any submodule commits that the parent refers to:
 
 ```bash
-git -C ~/dji-relay config submodule.recurse true
+git -C ~/PUC/dji-relay config submodule.recurse true
 ```
 
 ```bash
-git -C ~/dji-relay config push.recurseSubmodules on-demand
+git -C ~/PUC/dji-relay config push.recurseSubmodules on-demand
 ```
 
 ### 5.2 Database, build and analysis
 
 `ssl-aggregator`'s README is the reference for each step. Run them inside
-`~/dji-relay/ssl-aggregator`:
+`~/PUC/dji-relay/ssl-aggregator`:
 
 1. **PostgreSQL:** install and start it as described in "Install PostgreSQL" (`sudo apt install postgresql`, then enable the service).
 
 2. **Database:** copy `.env.example` to `.env`, set `PGPASSWORD` and `GRAFANA_PASSWORD`, then run `./scripts/db_init.sh` ("Database setup"). It creates the `robot_data` database, its schemas and roles.
 
-3. **Build** the loggers. This also confirms that the C++23 toolchain and libpqxx work:
+3. **Build** the loggers. This also confirms that the C++23 toolchain and libpqxx work. On 24.04, skip the README's `sudo apt install libpqxx-dev` (libpqxx comes from section 3.1) and configure with GCC 14 (section 1.1):
 
    ```bash
-   cmake -S . -B build
+   cmake -S . -B build -DCMAKE_CXX_COMPILER=g++-14
    ```
 
    ```bash
@@ -209,17 +298,17 @@ git -C ~/dji-relay config push.recurseSubmodules on-demand
    ```
 
    ```bash
-   python3 -m venv ~/dji-relay/ssl-aggregator/.venv
+   python3 -m venv ~/PUC/dji-relay/ssl-aggregator/.venv
    ```
 
    ```bash
-   ~/dji-relay/ssl-aggregator/.venv/bin/pip install -r ~/dji-relay/ssl-aggregator/analysis/requirements.txt
+   ~/PUC/dji-relay/ssl-aggregator/.venv/bin/pip install -r ~/PUC/dji-relay/ssl-aggregator/analysis/requirements.txt
    ```
 
    `analysis/requirements.txt` lists only the Stage 1–4 packages. The Stage 5 models also import `torch`, `optuna`, `xgboost` and `scikit-learn`:
 
    ```bash
-   ~/dji-relay/ssl-aggregator/.venv/bin/pip install torch optuna xgboost scikit-learn
+   ~/PUC/dji-relay/ssl-aggregator/.venv/bin/pip install torch optuna xgboost scikit-learn
    ```
 
 ### 5.3 v4l2loopback (the virtual camera SSL-Vision reads)
@@ -283,27 +372,33 @@ was built with V4L support, which is the default.
 1. Clone it:
 
    ```bash
-   git clone https://github.com/RoboCup-SSL/ssl-vision.git ~/ssl-vision
+   git clone https://github.com/RoboCup-SSL/ssl-vision.git ~/PUC/ssl-vision
    ```
 
-2. Install its dependencies. Its `InstallPackagesUbuntu.sh` script refuses Ubuntu 26.04 (it only knows 20.04–24.04), so install the same packages by hand:
+2. Install its dependencies. **(24.04)** Its `InstallPackagesUbuntu.sh` script supports Ubuntu 24.04, so run it. It calls `sudo apt-get` itself and asks for the password:
+
+   ```bash
+   cd ~/PUC/ssl-vision && ./InstallPackagesUbuntu.sh
+   ```
+
+   On a newer Ubuntu (for example 26.04) the script refuses to run, because it only knows up to 24.04. Install the same packages by hand instead:
 
    ```bash
    sudo apt install -y g++ cmake libeigen3-dev freeglut3-dev libopencv-dev qtdeclarative5-dev libqt5multimedia5 protobuf-compiler libprotobuf-dev libdc1394-dev libv4l-0
    ```
 
-   If apt reports that a Qt5 package does not exist on 26.04, stop and note it: that is open item V20 in the specification.
+   If apt reports that a Qt5 package does not exist there, stop and note it: that is open item V20 in the specification.
 
 3. Build it (a Release build through CMake, with V4L on by default):
 
    ```bash
-   make -C ~/ssl-vision
+   make -C ~/PUC/ssl-vision
    ```
 
 4. Run it with capture started. Add `-c 2` if a second camera (for example the ceiling camera indoors) runs together with the drone:
 
    ```bash
-   cd ~/ssl-vision && LC_NUMERIC=en_US.UTF-8 ./bin/vision -s
+   cd ~/PUC/ssl-vision && LC_NUMERIC=en_US.UTF-8 ./bin/vision -s
    ```
 
 5. In the drone's camera thread, choose the **V4L** capture module and set: `cam idx` 10 (it opens `/dev/video10`), `width` 1920, `height` 1080, `framerate` 30, `pixel format` YUYV. With the test pattern of 5.3 step 5 running, SSL-Vision should show it.
@@ -336,7 +431,45 @@ was built with V4L support, which is the default.
    adb version
    ```
 
-5. **Gradle JDK:** in **Settings → Build, Execution, Deployment → Build Tools → Gradle**, keep **Gradle JDK** on the bundled JDK (JetBrains Runtime 17 or 21).
+5. **JDK for Gradle (24.04).** The project pins Gradle 8.12 (from the DJI sample), which runs on Java 17–23 only. Two Java installations are already present, and neither works:
+   - Android Studio's bundled JDK (JetBrains Runtime) is **Java 25**. The build fails with `Unsupported class file major version 69`.
+   - Ubuntu's default `java` (`openjdk-21-jre`) is only a runtime, without a compiler. The build fails with `Toolchain installation '/usr/lib/jvm/java-21-openjdk-amd64' does not provide the required capabilities: [JAVA_COMPILER]`.
+
+   Install the full JDK 21 and point both Gradle and Android Studio to it:
+
+   1. Install it (it adds `javac`, `javap` and the other JDK tools to the existing Java 21):
+
+      ```bash
+      sudo apt install -y openjdk-21-jdk
+      ```
+
+   2. Check that the compiler is there (expect `javac 21.x`):
+
+      ```bash
+      /usr/lib/jvm/java-21-openjdk-amd64/bin/javac -version
+      ```
+
+   3. **Command-line builds:** add this line to the **user** file `~/.gradle/gradle.properties`, next to `DJI_API_KEY` (never to the project's `android/gradle.properties`, which is committed):
+
+      ```
+      org.gradle.java.home=/usr/lib/jvm/java-21-openjdk-amd64
+      ```
+
+   4. **Android Studio:** open the `android/` folder, then **Settings → Build, Execution, Deployment → Build Tools → Gradle → Gradle JDK** and choose the JDK 21 at `/usr/lib/jvm/java-21-openjdk-amd64` (add it with **Add JDK from disk** if it is not listed). Do not use the bundled JetBrains Runtime. If Android Studio offers to upgrade the Android Gradle Plugin, decline: the versions are pinned by the DJI sample.
+
+      Two pitfalls:
+      - **Gradle JDK is a per-project setting.** Open the project first (**File → Open → `~/PUC/dji-relay/android`**, the folder with `settings.gradle`, not the repository root). Set from the welcome screen, with no project open, the choice is not saved and the field returns to JBR 25.
+      - **Do not put the JDK path in Gradle user home.** That field, on the same screen, must stay empty (default `~/.gradle`). If it points elsewhere, Android Studio no longer reads `~/.gradle/gradle.properties`, so it loses `DJI_API_KEY` and `org.gradle.java.home`, and the sync fails.
+
+      The choice is stored in `android/.idea/gradle.xml` (`gradleJvm`), which is not committed.
+
+6. **SDK location for command-line builds.** Android Studio writes `android/local.properties` with the SDK path when it opens the project. To build from a terminal before that, create the file with this single line (it is machine-specific and ignored by git):
+
+   ```
+   sdk.dir=/home/<user>/Android/Sdk
+   ```
+
+   Without it, `./gradlew` fails with `SDK location not found`.
 
 The Android emulator is not useful here: the MSDK needs the real controller over USB.
 
@@ -375,6 +508,29 @@ Wi-Fi** (wireless debugging, Android 11+).
 Android Studio sees the phone after this and can install and debug the app over Wi-Fi.
 Turn wireless debugging off during the latency experiments, so its traffic does not
 share the channel with the video.
+
+> **Warning: duplicate adb connection.** Once the phone is paired, `adb` also finds it
+> by itself on the network (mDNS) and connects automatically. It then appears as
+> `adb-<serial>-<id>._adb-tls-connect._tcp`. If you also run `adb connect <IP>:<port>`,
+> the same phone is listed **twice** in `adb devices`. Then `adb install`, `adb logcat`
+> and the other commands fail with `more than one device/emulator`, and Android Studio
+> shows two devices.
+>
+> Keep only one connection. Usually the automatic one is enough, and `adb connect` is
+> not needed at all. If both are listed, drop the manual one (use the IP:port shown in
+> `adb devices`):
+>
+> ```bash
+> adb disconnect 192.168.1.50:41234
+> ```
+>
+> The connection port changes every time wireless debugging is turned on again, so an
+> old `IP:port` entry can also remain listed as `offline`. Remove it the same way.
+> The automatic entries are listed by:
+>
+> ```bash
+> adb mdns services
+> ```
 
 ### 7.2 Settings that affect the relay
 
@@ -441,19 +597,50 @@ Android Studio), also install the CLI.
 3. Start it from this repository's root and log in on the first run. The `ssl-aggregator` submodule is inside the repository, so Claude Code sees both projects. SSL-Vision, if it is needed, is added as a second working directory with `--add-dir`:
 
    ```bash
-   cd ~/dji-relay && claude --add-dir ~/ssl-vision
+   cd ~/PUC/dji-relay && claude --add-dir ~/PUC/ssl-vision
    ```
 
-   In the VS Code extension, open `~/dji-relay` as the folder. Add SSL-Vision with the `/add-dir ~/ssl-vision` command in a session, only if it is needed.
+   In the VS Code extension, open `~/PUC/dji-relay` as the folder. Add SSL-Vision with the `/add-dir ~/PUC/ssl-vision` command in a session, only if it is needed.
 
-### 9.3 Android Studio plugin (optional)
+### 9.3 Manual permission mode
+
+In this project Claude Code works in **Manual** mode: it asks before every command
+and file change. The mode is set once in two places, so the CLI and the VS Code
+extension both start in it.
+
+1. **CLI and all sessions:** in the user settings file `~/.claude/settings.json`, set
+   `permissions.defaultMode` to `"default"`, which is the internal name of the Manual
+   mode. Create the file if it does not exist. If it already exists, add only the
+   `defaultMode` key and keep the other keys:
+
+   ```json
+   {
+     "permissions": {
+       "defaultMode": "default"
+     }
+   }
+   ```
+
+2. **VS Code extension:** open **File → Preferences → Settings**, search for
+   `claudeCode.initialPermissionMode` and choose `default`. Or add it to the user
+   `settings.json` of VS Code:
+
+   ```json
+   "claudeCode.initialPermissionMode": "default"
+   ```
+
+The current mode is shown in the session's mode indicator. Do not switch to the modes
+that skip prompts (`acceptEdits`, `auto`, `dontAsk`, `bypassPermissions`) in this
+project.
+
+### 9.4 Android Studio plugin (optional)
 
 The Claude Code plugin for JetBrains IDEs supports Android Studio. Install the CLI
 (9.2) first, then install the **Claude Code** plugin from **Settings → Plugins →
 Marketplace** and restart. The plugin starts `claude` in Android Studio's terminal,
 shows the changes in the IDE's diff viewer and reads its error diagnostics.
 
-### 9.4 Why run it locally
+### 9.5 Why run it locally
 
 Running locally, with the phone paired over wireless `adb` and `drone_logger` on the
 same PC, Claude Code can run each step itself and check the results:
@@ -467,6 +654,6 @@ A cloud session cannot do this, because it has no access to the phone, the contr
 
 Safety rules for this project:
 
-- Keep Claude Code's permission prompts on (the default mode).
+- Keep Claude Code in **Manual** mode (section 9.3), so it asks before every command and change.
 - Do every bench test with the **propellers removed**.
 - The app only configures the camera and gimbal and starts and stops recording. It never sends flight commands.
