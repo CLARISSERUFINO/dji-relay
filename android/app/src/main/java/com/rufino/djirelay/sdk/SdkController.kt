@@ -47,6 +47,12 @@ object SdkController {
     private val initCalled = AtomicBoolean(false)
     private val initComplete = AtomicBoolean(false)
     private val keysStarted = AtomicBoolean(false)
+    /**
+     * True from registerApp() until onRegisterSuccess / onRegisterFailure. Without it the
+     * network listener could call registerApp() again while the first registration was
+     * still running; the app then registered twice and the camera list never arrived.
+     */
+    private val registering = AtomicBoolean(false)
 
     private val cameraStreamManager: ICameraStreamManager
         get() = MediaDataCenter.getInstance().cameraStreamManager
@@ -59,12 +65,21 @@ object SdkController {
 
         DJINetworkManager.getInstance().addNetworkStatusListener { isAvailable ->
             val registered = SDKManager.getInstance().isRegistered
-            Log.i(TAG, "network available=$isAvailable (initComplete=${initComplete.get()}, registered=$registered)")
+            Log.i(TAG, "network available=$isAvailable (initComplete=${initComplete.get()}, registered=$registered, registering=${registering.get()})")
             if (initComplete.get() && isAvailable && !registered) {
-                Log.i(TAG, "network back and not registered: registerApp()")
-                SDKManager.getInstance().registerApp()
+                registerOnce("network back and not registered")
             }
         }
+    }
+
+    /** Calls registerApp() unless a registration is already in progress. */
+    private fun registerOnce(reason: String) {
+        if (!registering.compareAndSet(false, true)) {
+            Log.i(TAG, "$reason: registration already in progress, not calling registerApp() again")
+            return
+        }
+        Log.i(TAG, "$reason: registerApp()")
+        SDKManager.getInstance().registerApp()
     }
 
     private val sdkCallback = object : SDKManagerCallback {
@@ -74,27 +89,31 @@ object SdkController {
             if (event == DJISDKInitEvent.INITIALIZE_COMPLETE) {
                 initComplete.set(true)
                 val version = SDKManager.getInstance().sdkVersion
-                Log.i(TAG, "MSDK version $version; registerApp()")
+                Log.i(TAG, "MSDK version $version")
                 _state.update { it.copy(sdkVersion = version) }
-                SDKManager.getInstance().registerApp()
+                registerOnce("INITIALIZE_COMPLETE")
             }
         }
 
         override fun onRegisterSuccess() {
             Log.i(TAG, "onRegisterSuccess")
+            registering.set(false)
             _state.update { it.copy(registered = true, registerError = null) }
-            startKeysAndCameraListener()
+            startKeys()
+            reattachCameraListener("onRegisterSuccess")
         }
 
         override fun onRegisterFailure(error: IDJIError) {
             val text = "${error.errorCode()}: ${error.description()}"
             Log.e(TAG, "onRegisterFailure: $error")
+            registering.set(false)
             _state.update { it.copy(registered = false, registerError = text) }
         }
 
         override fun onProductConnect(productId: Int) {
             Log.i(TAG, "onProductConnect: productId=$productId")
             _state.update { it.copy(productConnected = true, productId = productId) }
+            if (SDKManager.getInstance().isRegistered) reattachCameraListener("onProductConnect")
         }
 
         override fun onProductDisconnect(productId: Int) {
@@ -123,10 +142,10 @@ object SdkController {
     }
 
     /**
-     * Connection and identity keys, and the camera list. They stay subscribed for the
-     * whole process lifetime, so they also report disconnections and reconnections.
+     * Connection and identity keys. They stay subscribed for the whole process lifetime,
+     * so they also report disconnections and reconnections.
      */
-    private fun startKeysAndCameraListener() {
+    private fun startKeys() {
         if (!keysStarted.compareAndSet(false, true)) return
 
         listen(FlightControllerKey.KeyConnection) { v ->
@@ -153,24 +172,33 @@ object SdkController {
             Log.i(TAG, "firmware: remote controller target (RemoteControllerKey.KeyFirmwareMatchType) = $v")
             _state.update { it.copy(rcFirmwareTarget = v?.name) }
         }
+    }
 
-        cameraStreamManager.addAvailableCameraUpdatedListener(
-            object : ICameraStreamManager.AvailableCameraUpdatedListener {
-                override fun onAvailableCameraUpdated(availableCameraList: List<ComponentIndexType>) {
-                    val chosen = chooseCamera(availableCameraList)
-                    // V11: the camera index of the Mini 3 Pro.
-                    Log.i(TAG, "V11: available cameras = $availableCameraList; using $chosen")
-                    _state.update { it.copy(availableCameras = availableCameraList, cameraIndex = chosen) }
-                }
+    private val cameraListener = object : ICameraStreamManager.AvailableCameraUpdatedListener {
+        override fun onAvailableCameraUpdated(availableCameraList: List<ComponentIndexType>) {
+            val chosen = chooseCamera(availableCameraList)
+            // V11: the camera index of the Mini 3 Pro.
+            Log.i(TAG, "V11: available cameras = $availableCameraList; using $chosen")
+            _state.update { it.copy(availableCameras = availableCameraList, cameraIndex = chosen) }
+        }
 
-                // Declared `default` in the provided jar, but abstract in the runtime
-                // classes: without this override the MSDK throws AbstractMethodError.
-                // Rule: implement every method of MSDK interfaces, defaults included.
-                override fun onCameraStreamEnableUpdate(cameraStreamEnableMap: Map<ComponentIndexType, Boolean>) {
-                    Log.i(TAG, "camera stream enabled = $cameraStreamEnableMap")
-                }
-            }
-        )
+        // Declared `default` in the provided jar, but abstract in the runtime
+        // classes: without this override the MSDK throws AbstractMethodError.
+        // Rule: implement every method of MSDK interfaces, defaults included.
+        override fun onCameraStreamEnableUpdate(cameraStreamEnableMap: Map<ComponentIndexType, Boolean>) {
+            Log.i(TAG, "camera stream enabled = $cameraStreamEnableMap")
+        }
+    }
+
+    /**
+     * Removes and adds the camera-list listener again, so the list always arrives even if
+     * the MSDK reset its camera stream manager (seen in F1 after a double registration).
+     * Called on every onRegisterSuccess and onProductConnect.
+     */
+    private fun reattachCameraListener(reason: String) {
+        cameraStreamManager.removeAvailableCameraUpdatedListener(cameraListener)
+        cameraStreamManager.addAvailableCameraUpdatedListener(cameraListener)
+        Log.i(TAG, "camera list listener (re)attached ($reason)")
     }
 
     /** LEFT_OR_MAIN is the expected value (spec 7.3, [VERIFY]); otherwise the first one. */

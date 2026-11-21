@@ -20,6 +20,8 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.rufino.djirelay.sdk.SdkController
+import com.rufino.djirelay.storage.PhoneRecorder
+import com.rufino.djirelay.stream.StreamReceiver
 
 class MainActivity : ComponentActivity() {
 
@@ -51,18 +53,31 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 val state by SdkController.state.collectAsStateWithLifecycle()
+                val stream by StreamReceiver.stats.collectAsStateWithLifecycle()
+                val recorder by PhoneRecorder.state.collectAsStateWithLifecycle()
                 var pilotViewOn by rememberSaveable { mutableStateOf(true) }
                 StatusScreen(
                     state = state,
+                    stream = stream,
+                    recorder = recorder,
                     locationGranted = locationGranted,
                     pilotViewOn = pilotViewOn,
                     onPilotViewChange = { on ->
                         Log.i(SdkController.TAG, "pilot view ${if (on) "on" else "off"}")
                         pilotViewOn = on
                     },
+                    onPhoneRecordingChange = { start ->
+                        Log.i(SdkController.TAG, "phone recording ${if (start) "start" else "stop"} requested")
+                        if (start) PhoneRecorder.start() else PhoneRecorder.stop()
+                    },
                 )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        PhoneRecorder.refreshFreeSpace()
     }
 
     private fun hasLocationPermission() = locationPermissions.all {
