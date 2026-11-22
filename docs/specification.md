@@ -1,6 +1,6 @@
 # Specification: DJI Mini 3 Pro video and telemetry relay to the PC
 
-Revision 4.5. It replaces the original Portuguese specification.
+Revision 4.6. It replaces the original Portuguese specification.
 
 - Revision 2 recorded the F0 decisions.
 - Revision 3 integrated the existing capture and analysis system, [`ssl-aggregator`](https://github.com/LimaBR/ssl-aggregator).
@@ -10,6 +10,7 @@ Revision 4.5. It replaces the original Portuguese specification.
 - Revision 4.3: the phone backup becomes a phone recording started and stopped by the user (RF10, 7.10); the live stream to the PC is the primary path. Separate "Live streaming", "Phone recording" and "Drone recording (microSD)" controls (7.11, F3). NFR4 and E6 no longer require a continuous phone backup.
 - Revision 4.4: results of E1 and E2 (F2): Annex B, one access unit per callback, SPS/PPS before every IDR, H.264 High at 1440×1080, SEI as side data only (7.4, V2, V4, V10, V14). RTP timestamp = `pts_ms` × 90; the live-time correction is chosen in F4 (7.5, 10.2, V3, E2). No fixed 1920×1080 assumption: SSL-Vision has no resolution requirement (4, 8.3, 9.1, 11.1, V5, V19, V21).
 - Revision 4.5: F3 results. E10 moves to F4, and 10.2 step 3 becomes a decision of F4. The low-latency Wi-Fi lock is held from F3. Stream-listener watchdog after a drone reconnection (7.3). `drone_logger` video path as built: two pipelines, CSV output until F4, `video_live_NN.mkv`, caps for v4l2sink (8.3, 8.6, 9.1). v4l2loopback needs `max_buffers=4` for SSL-Vision (9.1).
+- Revision 4.6: F4a results. The 26 telemetry keys are verified with `javap` (7.7); telemetry snapshot with `KeyManager.getValue` on aircraft connection and at the start of live streaming and phone recording (7.7); the message format on UDP 5601 is fixed in `docs/protocol.md`; accepted values in `DRONE_EXPECT_*` (8.5); CSV files optional (8.6); `BatchWriter` drops rows after about 1.5 s without a database (8.2, open for F6).
 
 API names marked *verified* were checked against DJI SampleCode-V5 and the
 signatures in `dji-sdk-v5-aircraft-provided:5.20.1` (Appendix A), or against the
@@ -266,6 +267,8 @@ JSON, one message per datagram. Common fields: `type`, `seq` (per type),
   | Air link | `KeyFrequencyBand`, `KeyUpLinkQuality`, `KeyDownLinkQuality` |
 
   Subscriptions use `KeyManager.getInstance().listen(key, holder, listener)` and are cancelled with `cancelListen(holder)`. A `key_rates` message every 10 s reports the measured update rate of each key.
+
+  All 26 keys exist in 5.20.1 (`javap`, F4a): declared in `DJIFlightControllerKey` (`KeyFlightMode` in `FlightControllerKey`), `DJIGimbalKey`, `DJICameraKey` (`KeyCameraStorageInfos` in `CameraKey`), `DJIBatteryKey` and `DJIAirlinkKey`, reached through the public subclasses. A subscription only reports changes, so values that do not change on the ground would never be sent: the keys are subscribed again on each aircraft connection, and a **snapshot** (`KeyManager.getValue` for every key, sent with `"snapshot": true`) is taken on aircraft connection and when live streaming or the phone recording starts. On the bench, `KeyAircraftLocation3D` (no GPS fix) and `KeyNewlyGeneratedMediaFile` (no media yet) have no value. The message fields are in `docs/protocol.md`.
 - **`event`**: `session_start` (codec, resolution, RTP timestamp mode, SSRC, app and MSDK versions, payload size), `session_stop`, `record_start_requested`, `record_started` (when `KeyIsRecording` turns true), `record_stopped`, `media_file`, `camera_config_applied`, `camera_config_snapshot`, `airlink_band`, `gimbal_nadir`, `drop`, `reconnect`, `mime_changed`, `error`.
 - **`clock`**: see 7.8.
 
@@ -368,7 +371,7 @@ Changes to `ssl-aggregator` (made in the phases listed, not now):
 - `common::load_dotenv()` first, then `env_str` / `env_int` with defaults.
 - `common::now_rx()` right after each receive → `rx_wall` + `rx_monotonic` in every row. Video packets and clock beacons also store the kernel receive time (`SO_TIMESTAMPNS`, `CLOCK_REALTIME`, ns).
 - `capture_session` = the logger's start time, stamped on every row.
-- `BlockingQueue` + `BatchWriter` (one per table); no `ON CONFLICT` and no silent drops.
+- `BlockingQueue` + `BatchWriter` (one per table); no `ON CONFLICT` and no silent drops. (F4a: the existing `BatchWriter` drops a batch after 3 failed attempts, about 1.5 s without a database, with a message on stderr. NFR4 asks for tolerance of a temporarily unavailable database: to be addressed with E6 in F6.)
 - A health line to stderr once per second: frames/s, Mb/s, lost packets and frames, injected frames/s, latest offset estimate, recording state, mismatch count.
 - Clean exit via the shutdown handler, then `std::quick_exit` (the libpqxx 7.10 issue).
 
@@ -409,15 +412,15 @@ on every table. `live_frame` and `phone_frame` are joined on
 
 The live `w/h/fps/mime` and `camera_config_applied` / `camera_config_snapshot` are
 compared with the `DRONE_EXPECT_*` keys. Mismatches are printed prominently and
-stored in `drone.config_check`. Accepting 59.94 or 60 fps is a profile option.
+stored in `drone.config_check`. Accepting 59.94 or 60 fps is a profile option: each `DRONE_EXPECT_*` key holds one accepted value or a comma-separated list (e.g. `DRONE_EXPECT_FPS=59,60`); an unset key is not checked. In F4 the live `w/h/fps/mime` are checked; the camera settings are added in F5. A row is written each time a reported value changes.
 
 ### 8.6 Files per session
 
 ```
 $DRONE_OUTPUT_DIR/<capture_session>/
   video_live_NN.mkv   # original live bitstream (H.264), one per stream (8.3)
-  live_frames.csv     # one row per access unit (until F4, then drone.live_frame)
-  injected_frames.csv # injection time and RTP timestamp per frame (until F4)
+  live_frames.csv     # only with DRONE_CSV=1: one row per access unit (as drone.live_frame)
+  injected_frames.csv # only with DRONE_CSV=1: injection time and RTP timestamp per frame
   rtp_packets.csv     # only with DRONE_PACKET_LOG=1
   session.json        # effective configuration, versions, SSRC (F4)
   DJI_xxxx.MP4        # 4K/60 H.265, copied from the microSD afterwards
@@ -563,7 +566,7 @@ drone detections.
 | V3 | Reference of `presentationTimeMs`. Answered: UTC epoch ms, monotonic, tracks arrival; not a fixed-rate encoder clock. RTP timestamp = `pts_ms` × 90 | E2 (F2) |
 | V4 | SPS/PPS before every IDR? Answered: yes | E1 (F2) |
 | V5 | Live stream keeps its resolution and 30 fps while recording 4K/60 H.265? (1440×1080 measured in F2, camera mode not set; checked again in video mode) | F5, E3 |
-| V7 | Real update rate of the attitude and gimbal keys | `key_rates` |
+| V7 | Real update rate of the attitude and gimbal keys (on the bench most keys only change rarely: needs a flight) | `key_rates` |
 | V10 | Codec actually delivered on the live stream. Answered: H.264 High, level 4.0 | E1 (F2) |
 | V11 | Camera index value for the Mini 3 Pro. Answered: `LEFT_OR_MAIN` | F1 log |
 | V12 | `KeyVideoCodecFormat` sets the recording codec | F5, read back + file check |

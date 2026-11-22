@@ -6,7 +6,7 @@ from the phone to the PC only: the PC never sends anything to the phone.
 | Port | Content | Phase |
 |---|---|---|
 | UDP 5600 | Live video: RTP, H.264 (this document) | F3 |
-| UDP 5601 | JSON messages: `frame`, `telemetry`, `event`, `clock` (spec 7.7, 7.8) | F4 |
+| UDP 5601 | JSON messages: `frame`, `telemetry`, `event`, `key_rates`, `clock` (spec 7.7, 7.8) | F4 |
 
 Unicast to the PC's IP, entered in the app. One RTP stream per streaming session (from
 "Live streaming" on to off).
@@ -79,6 +79,73 @@ RFC 8285 one-byte form. 32 bytes in total, placed right after the 12-byte header
 - A new SSRC means a new streaming session. A new `segment` value means the drone stream
   was re-attached; neither requires restarting `drone_logger`.
 
-## Messages: JSON over UDP 5601 (F4)
+## Messages: JSON over UDP 5601
 
-Defined in spec 7.7 and 7.8 and fixed here in F4.
+One JSON object per datagram, UTF-8. Sent while "Live streaming" is on, from a socket
+bound to the Wi-Fi network like the video. The phone recording (spec 7.10) writes the
+same `telemetry`, `event` and `key_rates` messages to its `messages.jsonl`.
+
+### Common fields
+
+| Field | Content |
+|---|---|
+| `type` | `frame`, `telemetry`, `event`, `key_rates` or `clock` |
+| `seq` | Per type, from 0, +1 per message (gaps = lost datagrams). Restarts with each app process; for `clock`, with each live streaming session |
+| `t_ph_ns` | Phone `SystemClock.elapsedRealtimeNanos()` when the message was built (for `clock`: right before `sendto`) |
+| `t_ph_utc_ms` | Phone UTC, for humans only (not in `clock`) |
+| `phone_session` | UTC start of the live streaming session, `yyyyMMddTHHmmssZ` |
+
+### `frame`: one per access unit sent on 5600
+
+| Field | Content |
+|---|---|
+| `frame_idx`, `segment` | As in the RTP header extension |
+| `rtp_ts` | RTP timestamp of the access unit (32-bit) |
+| `rtp_seq_first`, `rtp_seq_last` | Sequence numbers of its first and last packet |
+| `pts_ms`, `t_rx_ns` | As in the RTP header extension |
+| `t_tx_ns` | `elapsedRealtimeNanos` right after the last packet was sent |
+| `key`, `size` | Keyframe flag; callback size in bytes |
+| `nal_types` | NAL types sent, in order (inserted SPS/PPS included) |
+| `sei` | `{count, types}` from `StreamInfo.getSeiList()` (payloads only in the phone recording) |
+| `w`, `h`, `fps`, `mime` | Only on keyframes and when one of them changes |
+
+### `telemetry`: one per key update
+
+| Field | Content |
+|---|---|
+| `key` | Key name, e.g. `KeyAircraftAttitude` (the list is in spec 7.7) |
+| `value` | DJI value objects as their `toJson()`; enums as their name; numbers, booleans and strings as they are; `KeyCameraStorageInfos` as `{current_type, storages: [...]}`; `null` if the SDK reports none |
+| `snapshot` | `true` when the value was read with `KeyManager.getValue` (on aircraft connection, live streaming start and phone recording start) rather than reported as a change |
+
+### `key_rates`: every 10 s
+
+`window_s` and `rates_hz` (`{key: updates per second}`), counting change reports only
+(snapshots are not counted).
+
+### `event`
+
+`event` = the name; other fields depend on it:
+
+| `event` | Fields |
+|---|---|
+| `session_start` | `ssrc`, `rtp_timestamp_mode` (`pts_ms*90`), `payload_max`, `codec`, `w`, `h`, `fps`, `app_version`, `msdk_version`, `video_port`, `message_port` |
+| `session_stop` | `frames_sent`, `drops`, `messages_sent`, `messages_dropped`, `beacons_sent` |
+| `reconnect` | `segment` (the drone stream was attached again) |
+| `drop` | `count`, `consumer` (`live`): frames dropped by the live queue |
+| `mime_changed` | `from`, `to` |
+
+### `clock`: one-way clock beacons, 10 Hz (spec 7.8)
+
+`{"type":"clock","seq":n,"phone_session":"...","t_ph_ns":t}`, with `t` read immediately
+before `sendto`. `drone_logger` stores each one with its kernel receive time
+(`SO_TIMESTAMPNS`, `CLOCK_REALTIME`). `d = rx_kernel_ns − t_ph_ns` is the clock offset
+plus the one-way delay; its lower envelope gives offset and drift.
+
+### Receiver rules (`drone_logger`)
+
+- Unknown `type` or invalid JSON: ignored and counted (`bad_msgs` in the health line).
+- `frame` → `drone.phone_frame`; `telemetry` → `drone.telemetry` (`value` as JSONB);
+  `event` and `key_rates` → `drone.event` (the whole message as JSONB); `clock` →
+  `drone.clock_beacon`.
+- `drone.live_frame` (from RTP) and `drone.phone_frame` are joined on
+  `(capture_session, segment, frame_idx)`.
