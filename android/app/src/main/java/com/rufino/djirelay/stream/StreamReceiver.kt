@@ -47,6 +47,8 @@ object StreamReceiver {
 
     @Volatile
     private var attachedIndex = ComponentIndexType.UNKNOWN
+    /** Times the watchdog re-added the listener (see start()). */
+    @Volatile private var rearms = 0
 
     // Written by the callback thread only; read by the 1 s stats ticker.
     private val frameCounter = AtomicLong(0)
@@ -78,10 +80,27 @@ object StreamReceiver {
             var lastFrames = 0L
             var lastBytes = 0L
             var loggedFirst = false
+            var idleSeconds = 0
+            var lastRearmMs = 0L
             while (true) {
                 delay(1000)
                 val frames = frameCounter.get()
                 val bytes = byteCounter.get()
+
+                // Watchdog: after a drone reconnection (F3) the re-added listener got no
+                // callbacks although the pilot view showed video. While attached and
+                // without callbacks for 5 s, remove and add the listener again (at most
+                // every 5 s). Same index, so no stream_detached/attached events.
+                val index = attachedIndex
+                idleSeconds = if (index != ComponentIndexType.UNKNOWN && frames == lastFrames) idleSeconds + 1 else 0
+                val nowMs = SystemClock.elapsedRealtime()
+                if (idleSeconds >= 5 && nowMs - lastRearmMs >= 5000) {
+                    lastRearmMs = nowMs
+                    rearms++
+                    Log.w(TAG, "stream: no callbacks for ${idleSeconds}s on $index, re-adding the listener (#$rearms)")
+                    cameraStreamManager.removeReceiveStreamListener(listener)
+                    cameraStreamManager.addReceiveStreamListener(index, listener)
+                }
                 if (!loggedFirst && firstBytesLen >= 0) {
                     loggedFirst = true
                     val hex = firstBytes.take(firstBytesLen).joinToString(" ") { "%02x".format(it) }

@@ -13,21 +13,30 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.rufino.djirelay.net.LiveSettings
+import com.rufino.djirelay.net.LiveState
 import com.rufino.djirelay.sdk.SdkState
 import com.rufino.djirelay.storage.RecorderState
 import com.rufino.djirelay.stream.StreamStats
@@ -43,6 +52,9 @@ fun StatusScreen(
     state: SdkState,
     stream: StreamStats,
     recorder: RecorderState,
+    live: LiveState,
+    onPcIpChange: (String) -> Unit,
+    onLiveStreamingChange: (Boolean) -> Unit,
     locationGranted: Boolean,
     pilotViewOn: Boolean,
     onPilotViewChange: (Boolean) -> Unit,
@@ -54,6 +66,9 @@ fun StatusScreen(
                 state = state,
                 stream = stream,
                 recorder = recorder,
+                live = live,
+                onPcIpChange = onPcIpChange,
+                onLiveStreamingChange = onLiveStreamingChange,
                 locationGranted = locationGranted,
                 pilotViewOn = pilotViewOn,
                 onPilotViewChange = onPilotViewChange,
@@ -84,6 +99,9 @@ private fun StatusPanel(
     state: SdkState,
     stream: StreamStats,
     recorder: RecorderState,
+    live: LiveState,
+    onPcIpChange: (String) -> Unit,
+    onLiveStreamingChange: (Boolean) -> Unit,
     locationGranted: Boolean,
     pilotViewOn: Boolean,
     onPilotViewChange: (Boolean) -> Unit,
@@ -142,6 +160,44 @@ private fun StatusPanel(
             if (stream.callbackMaxUs < 5000) Ok else Bad,
         )
         if (stream.poolExhausted > 0) Item("Pool exhausted", stream.poolExhausted.toString(), Bad)
+
+        Section("Live streaming (to the PC)")
+        var ipText by remember { mutableStateOf(live.pcIp) }
+        val ipValid = LiveSettings.isValidIpv4(ipText)
+        OutlinedTextField(
+            value = ipText,
+            onValueChange = {
+                ipText = it.trim()
+                if (LiveSettings.isValidIpv4(ipText)) onPcIpChange(ipText)
+            },
+            label = { Text("PC IP (port ${LiveSettings.VIDEO_PORT})") },
+            singleLine = true,
+            isError = ipText.isNotEmpty() && !ipValid,
+            enabled = !live.enabled,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Text("Live streaming", color = Color.White, modifier = Modifier.weight(1f))
+            Switch(
+                checked = live.enabled,
+                onCheckedChange = onLiveStreamingChange,
+                enabled = live.enabled || ipValid,
+            )
+        }
+        Item("Network", live.network, if (live.network == "wifi") Ok else if (live.enabled) Bad else Neutral)
+        if (live.enabled) {
+            Item("Rate", "%.2f Mb/s, %d pkt/s".format(live.megabitsPerSecond, live.packetsPerSecond))
+            Item("Frames sent", live.framesSent.toString())
+            Item("Segment / SSRC", "${live.segment} / ${live.ssrc ?: "-"}")
+            Item("Cb→send p95/max", "${live.latencyP95Us} / ${live.latencyMaxUs} µs", if (live.latencyP95Us < 5000) Ok else Bad)
+            Item("Drops", live.drops.toString(), if (live.drops == 0L) Ok else Bad)
+            if (live.framesNoNetwork > 0) Item("Not sent (no Wi-Fi)", live.framesNoNetwork.toString(), Bad)
+            if (live.sendErrors > 0) Item("Send errors", live.sendErrors.toString(), Bad)
+            if (live.noStartCode > 0) Item("No start code", live.noStartCode.toString(), Bad)
+        }
+        live.error?.let { Item("Error", it, Bad) }
 
         Section("Phone recording")
         Item(

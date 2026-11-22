@@ -19,6 +19,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.rufino.djirelay.net.LiveSender
 import com.rufino.djirelay.sdk.SdkController
 import com.rufino.djirelay.storage.PhoneRecorder
 import com.rufino.djirelay.stream.StreamReceiver
@@ -55,11 +56,18 @@ class MainActivity : ComponentActivity() {
                 val state by SdkController.state.collectAsStateWithLifecycle()
                 val stream by StreamReceiver.stats.collectAsStateWithLifecycle()
                 val recorder by PhoneRecorder.state.collectAsStateWithLifecycle()
+                val live by LiveSender.state.collectAsStateWithLifecycle()
                 var pilotViewOn by rememberSaveable { mutableStateOf(true) }
                 StatusScreen(
                     state = state,
                     stream = stream,
                     recorder = recorder,
+                    live = live,
+                    onPcIpChange = { ip -> LiveSender.setPcIp(ip) },
+                    onLiveStreamingChange = { on ->
+                        Log.i(SdkController.TAG, "live streaming ${if (on) "on" else "off"} requested")
+                        if (on) LiveSender.start() else LiveSender.stop()
+                    },
                     locationGranted = locationGranted,
                     pilotViewOn = pilotViewOn,
                     onPilotViewChange = { on ->

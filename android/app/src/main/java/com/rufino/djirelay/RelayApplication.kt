@@ -2,6 +2,7 @@ package com.rufino.djirelay
 
 import android.app.Application
 import android.content.Context
+import com.rufino.djirelay.net.LiveSender
 import com.rufino.djirelay.sdk.SdkController
 import com.rufino.djirelay.storage.PhoneRecorder
 import com.rufino.djirelay.stream.StreamReceiver
@@ -29,5 +30,6 @@ class RelayApplication : Application() {
         SdkController.init(this)
         StreamReceiver.start(appScope)
         PhoneRecorder.init(this)
+        LiveSender.init(this)
     }
 }
