@@ -10,7 +10,10 @@ import android.os.Build
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
+import com.rufino.djirelay.BuildConfig
 import com.rufino.djirelay.rtp.RtpPacketizer
+import com.rufino.djirelay.sdk.SdkController
+import com.rufino.djirelay.telemetry.TelemetryCollector
 import com.rufino.djirelay.sdk.SdkController.TAG
 import com.rufino.djirelay.stream.FrameQueue
 import com.rufino.djirelay.stream.StreamReceiver
@@ -18,6 +21,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -59,6 +64,20 @@ object LiveSender {
     @Volatile private var segment = 0
     @Volatile private var sawDetach = false
 
+    // Messages on UDP 5601 (spec 7.7, 7.8): a socket on the same Wi-Fi network, a thread
+    // that sends what MessageBus publishes, and a 10 Hz clock beacon thread.
+    @Volatile private var msgSocket: DatagramSocket? = null
+    @Volatile private var msgRunning = false
+    private val msgQueue = java.util.concurrent.ArrayBlockingQueue<String>(4096)
+    private val msgDropped = java.util.concurrent.atomic.AtomicLong(0)
+    private val msgSent = java.util.concurrent.atomic.AtomicLong(0)
+    private val beaconsSent = java.util.concurrent.atomic.AtomicLong(0)
+    private var msgThread: Thread? = null
+    private var beaconThread: Thread? = null
+    private val busSubscriber = MessageBus.Subscriber { _, json ->
+        if (!msgQueue.offer(json)) msgDropped.incrementAndGet()
+    }
+
     private var thread: Thread? = null
     private var queue: FrameQueue? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -77,6 +96,7 @@ object LiveSender {
                     sawDetach = false
                     segment++
                     Log.i(TAG, "live: stream re-attached, segment=$segment")
+                    MessageBus.event("reconnect") { it.put("segment", segment) }
                 }
             }
         }
@@ -95,7 +115,9 @@ object LiveSender {
             _state.update { it.copy(error = "invalid PC IP") }
             return false
         }
-        val target = InetSocketAddress(InetAddress.getByName(ip), LiveSettings.VIDEO_PORT)
+        val pc = InetAddress.getByName(ip)
+        val target = InetSocketAddress(pc, LiveSettings.VIDEO_PORT)
+        val msgTarget = InetSocketAddress(pc, LiveSettings.MESSAGE_PORT)
 
         val rnd = SecureRandom()
         val ssrc = rnd.nextInt()
@@ -113,10 +135,33 @@ object LiveSender {
             enabled = true, pcIp = ip, ssrc = "%08x".format(ssrc),
             network = if (socket != null) "wifi" else "waiting for Wi-Fi",
         )
+        val session = MessageBus.newPhoneSession()
+        msgQueue.clear()
+        msgDropped.set(0)
+        msgSent.set(0)
+        beaconsSent.set(0)
+        MessageBus.subscribe(busSubscriber)
+        msgRunning = true
+        msgThread = Thread({ messageLoop(msgTarget) }, "LiveMessages").also { it.start() }
+        TelemetryCollector.snapshot("live streaming started")
+        beaconThread = Thread({ beaconLoop(msgTarget) }, "ClockBeacon").also { it.start() }
+        val st = StreamReceiver.stats.value
+        MessageBus.event("session_start") { o ->
+            o.put("ssrc", "%08x".format(ssrc))
+            o.put("rtp_timestamp_mode", "pts_ms*90")
+            o.put("payload_max", RtpPacketizer.DEFAULT_MAX_PAYLOAD)
+            o.put("codec", st.mime ?: JSONObject.NULL)
+            o.put("w", st.width).put("h", st.height).put("fps", st.frameRate)
+            o.put("app_version", BuildConfig.VERSION_NAME)
+            o.put("msdk_version", SdkController.state.value.sdkVersion ?: JSONObject.NULL)
+            o.put("video_port", LiveSettings.VIDEO_PORT).put("message_port", LiveSettings.MESSAGE_PORT)
+        }
+
         val t = Thread({ sendLoop(q, packetizer, target) }, "LiveSender")
         thread = t
         t.start()
         StreamReceiver.addConsumer(q)
+        Log.i(TAG, "live: phone_session=$session, messages to ${ip}:${LiveSettings.MESSAGE_PORT}")
         Log.i(TAG, "live: started, ${ip}:${LiveSettings.VIDEO_PORT}, ssrc=%08x".format(ssrc))
         return true
     }
@@ -129,6 +174,18 @@ object LiveSender {
         thread?.join(2000)
         thread = null
         queue = null
+        val s = _state.value
+        MessageBus.event("session_stop") { o ->
+            o.put("frames_sent", s.framesSent).put("drops", s.drops)
+            o.put("messages_sent", msgSent.get()).put("messages_dropped", msgDropped.get())
+            o.put("beacons_sent", beaconsSent.get())
+        }
+        MessageBus.unsubscribe(busSubscriber)
+        msgRunning = false
+        msgThread?.join(2000)   // ends once the queue is drained (session_stop included)
+        beaconThread?.join(1000)
+        msgThread = null
+        beaconThread = null
         releaseNetwork()
         releaseWifiLock()
         _state.update { it.copy(enabled = false, network = "off") }
@@ -170,7 +227,9 @@ object LiveSender {
                             framesNoNetwork++
                         } else {
                             packetizer.packetize(frame, segment, emit)
+                            val tTx = SystemClock.elapsedRealtimeNanos()
                             framesSent++
+                            publishFrame(frame, packetizer, tTx)
                             // NFR1: callback -> sendto of the frame's last packet.
                             val d = SystemClock.elapsedRealtimeNanos() - frame.tRxNs
                             latencyNs[latencyCount % LATENCY_RING] = d
@@ -181,6 +240,9 @@ object LiveSender {
                         frame.release()
                     }
                 }
+
+                val dropped = q.takeDropped()
+                if (dropped > 0) MessageBus.event("drop") { it.put("count", dropped).put("consumer", "live") }
 
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastTickMs >= 1000) {
@@ -221,6 +283,87 @@ object LiveSender {
         }
     }
 
+    // ---- Messages (UDP 5601)
+
+    private var lastFormat: String? = null
+    private var lastMime: String? = null
+
+    /** `frame` message (spec 7.7), one per access unit sent. */
+    private fun publishFrame(f: com.rufino.djirelay.stream.Frame, p: RtpPacketizer, tTxNs: Long) {
+        val mime = f.mime?.name
+        if (mime != lastMime && lastMime != null) {
+            val from = lastMime
+            MessageBus.event("mime_changed") { it.put("from", from).put("to", mime ?: JSONObject.NULL) }
+        }
+        lastMime = mime
+        val format = "${f.width}x${f.height}@${f.frameRate}/$mime"
+        val withFormat = f.keyFrame || format != lastFormat
+        lastFormat = format
+        MessageBus.publish("frame") { o ->
+            o.put("frame_idx", f.frameIdx)
+            o.put("segment", segment)
+            o.put("rtp_ts", p.lastTimestamp and 0xFFFFFFFFL)
+            o.put("rtp_seq_first", p.lastSeqFirst)
+            o.put("rtp_seq_last", p.lastSeqLast)
+            o.put("pts_ms", f.ptsMs)
+            o.put("t_rx_ns", f.tRxNs)
+            o.put("t_tx_ns", tTxNs)
+            o.put("key", f.keyFrame)
+            o.put("size", f.length)
+            o.put("nal_types", JSONArray().apply { for (i in 0 until p.lastNalCount) put(p.lastNalTypes[i]) })
+            o.put("sei", JSONObject().put("count", f.seiTypes.size)
+                .put("types", JSONArray().apply { f.seiTypes.forEach { put(it) } }))
+            if (withFormat) o.put("w", f.width).put("h", f.height).put("fps", f.frameRate).put("mime", mime ?: JSONObject.NULL)
+        }
+    }
+
+    /** Sends what MessageBus publishes; ends when stopped and the queue is empty. */
+    private fun messageLoop(target: InetSocketAddress) {
+        val dgram = DatagramPacket(ByteArray(0), 0, target)
+        while (msgRunning || msgQueue.isNotEmpty()) {
+            val json = msgQueue.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
+            val s = msgSocket ?: continue  // no Wi-Fi: the message is lost (counted by the PC as a seq gap)
+            val bytes = json.toByteArray(Charsets.UTF_8)
+            dgram.setData(bytes, 0, bytes.size)
+            try {
+                s.send(dgram)
+                msgSent.incrementAndGet()
+            } catch (e: IOException) {
+                msgDropped.incrementAndGet()
+            }
+        }
+    }
+
+    /**
+     * One-way clock beacons (spec 7.8): `{type:"clock", seq, t_ph_ns, phone_session}` at
+     * 10 Hz, with t_ph_ns read immediately before sendto.
+     */
+    private fun beaconLoop(target: InetSocketAddress) {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+        val dgram = DatagramPacket(ByteArray(0), 0, target)
+        val session = MessageBus.phoneSession
+        val periodNs = 100_000_000L
+        var next = SystemClock.elapsedRealtimeNanos()
+        var seq = 0L
+        while (running) {
+            next += periodNs
+            val sleepMs = (next - SystemClock.elapsedRealtimeNanos()) / 1_000_000
+            if (sleepMs > 0) Thread.sleep(sleepMs)
+            val s = msgSocket ?: continue
+            val prefix = "{\"type\":\"clock\",\"seq\":$seq,\"phone_session\":\"$session\",\"t_ph_ns\":"
+            val t = SystemClock.elapsedRealtimeNanos()
+            val bytes = (prefix + t + "}").toByteArray(Charsets.US_ASCII)
+            dgram.setData(bytes, 0, bytes.size)
+            try {
+                s.send(dgram)
+                seq++
+                beaconsSent.incrementAndGet()
+            } catch (e: IOException) {
+                // counted as missing seq on the PC side
+            }
+        }
+    }
+
     // ---- Wi-Fi network and socket
 
     private fun requestWifiNetwork() {
@@ -251,8 +394,11 @@ object LiveSender {
             n.bindSocket(s)
             s.trafficClass = DSCP_AF41
             s.sendBufferSize = 1 shl 20
+            val m = DatagramSocket()
+            n.bindSocket(m)
             network = n
             socket = s
+            msgSocket = m
             Log.i(TAG, "live: socket bound to Wi-Fi network $n, traffic class 0x%02x".format(s.trafficClass))
         } catch (e: IOException) {
             Log.e(TAG, "live: cannot open socket on $n", e)
@@ -263,6 +409,8 @@ object LiveSender {
     private fun closeSocket() {
         socket?.close()
         socket = null
+        msgSocket?.close()
+        msgSocket = null
         network = null
     }
 

@@ -6,6 +6,8 @@ import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
 import com.rufino.djirelay.BuildConfig
+import com.rufino.djirelay.net.MessageBus
+import com.rufino.djirelay.telemetry.TelemetryCollector
 import com.rufino.djirelay.sdk.SdkController
 import com.rufino.djirelay.sdk.SdkController.TAG
 import com.rufino.djirelay.stream.Frame
@@ -55,6 +57,18 @@ object PhoneRecorder {
 
     private val pendingEvents = ConcurrentLinkedQueue<Pair<String, String>>()
 
+    /**
+     * Messages from MessageBus (telemetry, key_rates, live events), written as they are.
+     * The bus `frame` messages are skipped: the recording writes its own frame lines,
+     * with file_offset into stream.h264.
+     */
+    private val busLines = ConcurrentLinkedQueue<String>()
+    private val busDropped = java.util.concurrent.atomic.AtomicLong(0)
+    private val busSubscriber = MessageBus.Subscriber { type, json ->
+        if (type == "frame") return@Subscriber
+        if (busLines.size < 20_000) busLines.add(json) else busDropped.incrementAndGet()
+    }
+
     @Volatile
     private var running = false
     private var writerThread: Thread? = null
@@ -99,6 +113,10 @@ object PhoneRecorder {
         val q = FrameQueue(QUEUE_CAPACITY)
         queue = q
         pendingEvents.clear()
+        busLines.clear()
+        busDropped.set(0)
+        MessageBus.subscribe(busSubscriber)
+        TelemetryCollector.snapshot("phone recording started")
         running = true
         _state.update {
             RecorderState(recording = true, sessionName = name, freeBytes = free)
@@ -118,6 +136,7 @@ object PhoneRecorder {
     fun stop() {
         if (!running) return
         queue?.let { StreamReceiver.removeConsumer(it) }
+        MessageBus.unsubscribe(busSubscriber)
         running = false
         writerThread?.join(5000)
         writerThread = null
@@ -157,6 +176,7 @@ object PhoneRecorder {
 
             while (running || q.size() > 0) {
                 drainEvents(session)
+                while (true) session.writeRaw(busLines.poll() ?: break)
                 val dropped = q.takeDropped()
                 if (dropped > 0) {
                     session.event("drop", JSONObject().put("count", dropped).put("consumer", "phone_recording"))
@@ -201,6 +221,7 @@ object PhoneRecorder {
                 }
             }
             drainEvents(session)
+            while (true) session.writeRaw(busLines.poll() ?: break)
             val dropped = q.takeDropped()
             if (dropped > 0) {
                 session.event("drop", JSONObject().put("count", dropped).put("consumer", "phone_recording"))
@@ -211,7 +232,8 @@ object PhoneRecorder {
                     .put("reason", stopReason)
                     .put("frames", frames)
                     .put("bytes", fileOffset)
-                    .put("drops", q.droppedTotal.get()),
+                    .put("drops", q.droppedTotal.get())
+                    .put("bus_messages_dropped", busDropped.get()),
             )
         } catch (e: Exception) {
             Log.e(TAG, "phone recording: write failed", e)
@@ -296,6 +318,11 @@ object PhoneRecorder {
                 .put("t_ph_ns", SystemClock.elapsedRealtimeNanos())
                 .put("t_ph_utc_ms", System.currentTimeMillis())
                 .put("phone_session", phoneSession)
+        }
+
+        fun writeRaw(line: String) {
+            out.write(line)
+            out.newLine()
         }
 
         private fun write(o: JSONObject) {

@@ -9,6 +9,9 @@ import com.rufino.djirelay.stream.StreamReceiver
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import com.rufino.djirelay.telemetry.TelemetryCollector
 
 /**
  * Same structure as SampleCode-V5's DJIAircraftApplication / DJIApplication (both are
@@ -31,5 +34,10 @@ class RelayApplication : Application() {
         StreamReceiver.start(appScope)
         PhoneRecorder.init(this)
         LiveSender.init(this)
+        // Telemetry keys are subscribed once the app is registered (spec 7.2 step 6).
+        appScope.launch {
+            SdkController.state.first { it.registered }
+            TelemetryCollector.start(appScope)
+        }
     }
 }

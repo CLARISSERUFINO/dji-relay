@@ -13,6 +13,7 @@ class LiveSettings(context: Context) {
     companion object {
         private const val KEY_PC_IP = "pc_ip"
         const val VIDEO_PORT = 5600
+        const val MESSAGE_PORT = 5601
 
         /** Dotted IPv4 literal check (no DNS lookup). */
         fun isValidIpv4(s: String): Boolean {

@@ -24,7 +24,7 @@ import com.rufino.djirelay.stream.Frame
 class RtpPacketizer(
     private val ssrc: Int,
     initialSequence: Int,
-    private val maxPayload: Int = 1200,
+    private val maxPayload: Int = DEFAULT_MAX_PAYLOAD,
 ) {
     val packet = ByteArray(RTP_HEADER + EXT_BYTES + maxPayload + 2)
 
@@ -53,6 +53,16 @@ class RtpPacketizer(
 
     /** The RTP timestamp of the last access unit (unwrapped, before the 32-bit mask). */
     val lastTimestamp: Long get() = lastTs
+
+    /** Sequence numbers of the first and last packet of the last access unit. */
+    var lastSeqFirst = 0
+        private set
+    var lastSeqLast = 0
+        private set
+    /** NAL types sent for the last access unit (inserted SPS/PPS included), in order. */
+    val lastNalTypes = IntArray(64)
+    var lastNalCount = 0
+        private set
 
     fun interface Emit {
         fun send(buf: ByteArray, len: Int)
@@ -92,6 +102,8 @@ class RtpPacketizer(
         }
         if (lastIndex < 0) return
 
+        lastSeqFirst = sequence
+        lastNalCount = 0
         var first = true
         if (insertSps) {
             sendNal(sps, 0, spsLen, ts, last = false, ext = if (first) frame else null, segment, emit); first = false
@@ -105,6 +117,7 @@ class RtpPacketizer(
             sendNal(data, s, parser.nalEnd[i] - s, ts, last = i == lastIndex, ext = if (first) frame else null, segment, emit)
             first = false
         }
+        lastSeqLast = (sequence - 1) and 0xFFFF
     }
 
     /** `pts_ms` × 90, strictly increasing within the streaming session. */
@@ -126,6 +139,7 @@ class RtpPacketizer(
         src: ByteArray, start: Int, len: Int, ts: Long, last: Boolean,
         ext: Frame?, segment: Int, emit: Emit,
     ) {
+        if (lastNalCount < lastNalTypes.size) lastNalTypes[lastNalCount++] = src[start].toInt() and 0x1F
         var extFrame = ext
         val firstLimit = if (extFrame != null) maxPayload - EXT_BYTES else maxPayload
         if (len <= firstLimit) {
@@ -201,6 +215,7 @@ class RtpPacketizer(
 
     companion object {
         const val RTP_HEADER = 12
+        const val DEFAULT_MAX_PAYLOAD = 1200
         const val PAYLOAD_TYPE = 96
         /** 4-byte 0xBEDE header + 25 bytes of elements + 3 padding = 32 bytes. */
         const val EXT_WORDS = 7
