@@ -1,6 +1,6 @@
 # Specification: DJI Mini 3 Pro video and telemetry relay to the PC
 
-Revision 4.4. It replaces the original Portuguese specification.
+Revision 4.5. It replaces the original Portuguese specification.
 
 - Revision 2 recorded the F0 decisions.
 - Revision 3 integrated the existing capture and analysis system, [`ssl-aggregator`](https://github.com/LimaBR/ssl-aggregator).
@@ -9,6 +9,7 @@ Revision 4.4. It replaces the original Portuguese specification.
 - Revision 4.2: corrections from F1, checked with `javap` on 5.20.1 and against SampleCode-V5: the `Application` class, the full `SDKManagerCallback`, `KeyConnection` usage, the accessory filter, the build JDK, and the firmware-version keys (sections 7.1, 7.2, Appendix A). The PC runs Ubuntu 24.04, not 26.04 (sections 4, 6, V20).
 - Revision 4.3: the phone backup becomes a phone recording started and stopped by the user (RF10, 7.10); the live stream to the PC is the primary path. Separate "Live streaming", "Phone recording" and "Drone recording (microSD)" controls (7.11, F3). NFR4 and E6 no longer require a continuous phone backup.
 - Revision 4.4: results of E1 and E2 (F2): Annex B, one access unit per callback, SPS/PPS before every IDR, H.264 High at 1440×1080, SEI as side data only (7.4, V2, V4, V10, V14). RTP timestamp = `pts_ms` × 90; the live-time correction is chosen in F4 (7.5, 10.2, V3, E2). No fixed 1920×1080 assumption: SSL-Vision has no resolution requirement (4, 8.3, 9.1, 11.1, V5, V19, V21).
+- Revision 4.5: F3 results. E10 moves to F4, and 10.2 step 3 becomes a decision of F4. The low-latency Wi-Fi lock is held from F3. Stream-listener watchdog after a drone reconnection (7.3). `drone_logger` video path as built: two pipelines, CSV output until F4, `video_live_NN.mkv`, caps for v4l2sink (8.3, 8.6, 9.1). v4l2loopback needs `max_buffers=4` for SSL-Vision (9.1).
 
 API names marked *verified* were checked against DJI SampleCode-V5 and the
 signatures in `dji-sdk-v5-aircraft-provided:5.20.1` (Appendix A), or against the
@@ -212,6 +213,8 @@ and logs the result. That gives three separate bands: O3 on 5.8 GHz, the phone o
 3. Enqueue it in the bounded queue (about 1 s) of each active consumer: the live sender (F3) and, while it runs, the phone recording (7.10). Each consumer has its own queue, so a slow one never delays the other.
 4. Return.
 
+**Reconnection (F3):** after a drone reconnection, the re-added listener may receive no callbacks although the pilot view shows video. A watchdog removes and adds the listener again while it is attached and has had no callback for 5 s (at most every 5 s); in F3 the stream resumed after two re-adds, about 10 s after the drone reconnected.
+
 No I/O and no large allocations in the callback. **Always copy**: the sample hands `data` to another thread without copying. **Never drop the first callback**: the sample does, and it may carry SPS/PPS. When a consumer's queue is full, that consumer drops frames until the next keyframe and emits a `drop` event.
 
 ### 7.4 NAL parsing
@@ -235,14 +238,14 @@ No I/O and no large allocations in the callback. **Always copy**: the sample han
   | 2 | 8 bytes | `pts_ms`: raw `presentationTimeMs`, big-endian int64 |
   | 3 | 6 bytes | `frame_idx` (uint32) + `segment` (uint16), big-endian |
 
-  32 bytes in total, including padding. `rtph264depay` ignores it. The layout is frozen in `docs/protocol.md` during F3.
+  32 bytes in total, including padding. `rtph264depay` ignores it. The wire format is fixed in `docs/protocol.md`.
 
 ### 7.6 Transport
 
 - Unicast to the PC's IP, which is entered in the app and persisted.
 - Request the Wi-Fi network (`TRANSPORT_WIFI`) and **bind each socket** with `Network.bindSocket`. Never use `bindProcessToNetwork`.
-- Video socket: `setTrafficClass(0x88)` (DSCP AF41). `WifiLock` `WIFI_MODE_FULL_LOW_LATENCY`.
-- Foreground service of type **`connectedDevice`** (permission `FOREGROUND_SERVICE_CONNECTED_DEVICE`), a `PARTIAL_WAKE_LOCK`, and `FLAG_KEEP_SCREEN_ON` for the whole session.
+- Video socket: `setTrafficClass(0x88)` (DSCP AF41). `WifiLock` `WIFI_MODE_FULL_LOW_LATENCY`, held while live streaming (from F3).
+- (F6) Foreground service of type **`connectedDevice`** (permission `FOREGROUND_SERVICE_CONNECTED_DEVICE`), a `PARTIAL_WAKE_LOCK`, and `FLAG_KEEP_SCREEN_ON` for the whole session.
 - High-priority sender thread. No allocation per packet.
 
 ### 7.7 Messages on UDP :5601
@@ -378,7 +381,11 @@ Changes to `ssl-aggregator` (made in the phases listed, not now):
      - **decoding:** `DRONE_DECODER` (`nvh264dec`, fallback `avdec_h264`) → `tee`:
        - **SSL-Vision injection** (on by default, `DRONE_INJECT=1`): `videoconvert` → `video/x-raw, format=YUY2` at the live stream's resolution, `framerate=30/1` → `v4l2sink device=$DRONE_V4L2_DEVICE sync=false`. A pad probe before the sink stamps each frame's injection time (`now_rx()`) and its RTP timestamp into `drone.live_frame`;
        - **display** (optional, `DRONE_SHOW_VIDEO`): `videoconvert` → sink with `sync=false`.
-- The pipeline is rebuilt automatically after a stream interruption, but the v4l2loopback device stays open. While no frames arrive, nothing is written, so SSL-Vision simply waits.
+- As built in F3, this is split into two GStreamer pipelines:
+  - a **stream pipeline**, built for each stream: on the first packet, on a new SSRC, and after no packets for `DRONE_STREAM_TIMEOUT_MS` (2000). It runs from `appsrc` to the recording (`video_live_NN.mkv`, NN = stream number in the session, finalised with EOS when the stream ends) and to the decoder, whose YUY2 frames go to an `appsink`;
+  - an **injection pipeline**, built on the first decoded frame and kept for the whole run: `appsrc` → `v4l2sink` (+ the optional display). The v4l2loopback device therefore stays open across stream interruptions; while no frames arrive, nothing is written, and SSL-Vision simply waits. It is rebuilt only if the resolution changes, or after an error (at most every 2 s).
+- Caps for `v4l2sink` (F3): v4l2loopback 0.12 accepts YUY2 only with `interlace-mode=progressive` and `colorimetry=2:4:7:1`, and refuses the decoder's extra fields; the drone's SPS has no frame rate (`0/1`). The injection caps are therefore set to format, size, pixel aspect ratio, those two fields and 30/1. They are labels only: no pixel conversion, and frames are passed on as they arrive (`sync=false`).
+- Until F4, the per-frame rows go to CSV files in the session folder (8.6) instead of `drone.live_frame`.
 - Optional per-packet log (`DRONE_PACKET_LOG=1`): `rtp_packets.csv` next to the `.mkv`, for experiments E1–E5. It is off by default.
 
 ### 8.4 Database: schema `drone`
@@ -408,9 +415,11 @@ stored in `drone.config_check`. Accepting 59.94 or 60 fps is a profile option.
 
 ```
 $DRONE_OUTPUT_DIR/<capture_session>/
-  video_live.mkv      # original live bitstream (H.264)
+  video_live_NN.mkv   # original live bitstream (H.264), one per stream (8.3)
+  live_frames.csv     # one row per access unit (until F4, then drone.live_frame)
+  injected_frames.csv # injection time and RTP timestamp per frame (until F4)
   rtp_packets.csv     # only with DRONE_PACKET_LOG=1
-  session.json        # effective configuration, versions, SSRC
+  session.json        # effective configuration, versions, SSRC (F4)
   DJI_xxxx.MP4        # 4K/60 H.265, copied from the microSD afterwards
   DJI_xxxx.SRT        # subtitles, if they were accepted
 ```
@@ -426,7 +435,7 @@ example the ceiling camera indoors), SSL-Vision runs with several camera threads
 
 ### 9.1 Live injection (v4l2loopback → V4L module)
 
-- The `v4l2loopback` kernel module creates a virtual camera, for example `/dev/video10` (`video_nr=10 card_label="DJI drone" exclusive_caps=1`). `drone_logger` writes decoded frames to it; SSL-Vision reads it like a USB webcam.
+- The `v4l2loopback` kernel module creates a virtual camera, for example `/dev/video10` (`video_nr=10 card_label="DJI drone" exclusive_caps=1 max_buffers=4`; SSL-Vision's V4L module requests 3 buffers and fails with the default of 2, see V19 in F3). `drone_logger` writes decoded frames to it; SSL-Vision reads it like a USB webcam.
 - SSL-Vision settings for that camera thread: capture module **V4L**, `cam idx` = the device number, `width` and `height` = the live stream's resolution (SSL-Vision has no requirement on it), `framerate` 30, `pixel format` **YUYV**.
 - Advantages: SSL-Vision needs **no code changes**; the device survives stream interruptions; `drone_logger` knows exactly when each frame was handed over (`inject_*`), which makes the correction in section 10.2 possible.
 - **[VERIFY] V18:**
@@ -473,7 +482,7 @@ family as `rx_wall`), so that Stage 1 can match the LED edges against
 2. **Estimated capture time of each live frame:** chosen in the F4 analysis. E2 (F2) showed that `pts_ms` is UTC epoch milliseconds that moves with the arrival times (correlation 0.91, sd of `t_rx − pts` about 4 ms), not a fixed-rate encoder clock, and that neither `pts_ms` nor the arrival times fit a regular 30 fps grid. The two options considered before E2 (map `pts_ms` through the lower envelope of `(arrival − pts)`, or fit a regular 30 fps grid) therefore do not apply as they are.
 
    The constant part of the latency remains, and Stage 1 absorbs it.
-3. **Match** each SSL-Vision frame (`vision.*`, drone `camera_id`) to a `drone.live_frame` by `t_capture` ≈ `inject_wall` (nearest, within a few ms). Then replace `t_capture` with the estimated capture time.
+3. **(Decided in F4)** **Match** each SSL-Vision frame (`vision.*`, drone `camera_id`) to a `drone.live_frame` by `t_capture` ≈ `inject_wall` (nearest, within a few ms). Then replace `t_capture` with the estimated capture time. Stage 1 already absorbs the constant latency and the drift; this step only removes per-frame jitter. Since `pts_ms` itself follows the arrival times (E2), it would remove only the PC-side part of that jitter. F4 decides, from E10 and the analysis data, whether the step is needed; if not, it is dropped.
 4. **Stage 1** as today: the robust linear fit to the LED edges absorbs the remaining offset and any rate error.
 
 ### 10.3 Replay: file time map (analysis)
@@ -562,8 +571,8 @@ drone detections.
 | V14 | Content of the SEI entries (any capture timestamp?). Partly answered: side data only, type 240, 25 bytes per frame; format undocumented, no field identified as a capture timestamp | E1 (F2) |
 | V16 | `KeyFrequencyBand` can be set to 5.8 GHz on the Mini 3 Pro in Brazil | F5 |
 | V17 | Latency from `record_started` to the first frame of the 4K file | E3 |
-| V18 | V4L2 buffer timestamp passes through v4l2loopback to SSL-Vision's `t_capture_camera` | E10 |
-| V19 | SSL-Vision's V4L module accepts YUYV at the live resolution from v4l2loopback (it opens `/dev/video<cam idx>`, verified in the source) | F3 bench |
+| V18 | V4L2 buffer timestamp passes through v4l2loopback to SSL-Vision's `t_capture_camera` | E10 (F4) |
+| V19 | SSL-Vision's V4L module accepts YUYV at the live resolution from v4l2loopback (it opens `/dev/video<cam idx>`, verified in the source). Answered: yes, at 1440×1080, with v4l2loopback `max_buffers=4` | F3 bench |
 | V20 | SSL-Vision builds on Ubuntu 24.04 (its install script supports 20.04–24.04; Qt5 packages must exist). Built in `~/PUC/ssl-vision` (`bin/vision` exists); it runs on the same PC as the loggers. Confirmed | Environment setup, before F3 |
 | V21 | Real video field of view of the Mini 3 Pro at 4K and at the live resolution | E9 (field calibration) |
 
@@ -580,7 +589,7 @@ drone detections.
 - **E7 Clock:** residual of the beacon fit (lower envelope) < 2 ms over 30 min.
 - **E8 Field:** flight at the chosen height over the track, with the robot and the static reference patterns. *Accept:* every table and file in sections 8.4 and 8.6 complete; robot loss at baseline; the time maps of section 10 within ±0.5 s; Stage 1 converges on the drone's LED edges (live; and replayed too, if F7 was done).
 - **E9 SSL-Vision on the drone:** at two or three heights, live through the virtual camera. Compare with the same flight's 4K file opened by hand in SSL-Vision's Video module, which needs no new code. *Accept:* documented detection rates of the robot and of the LED-as-ball, and the position noise of a static pattern. The height and the marker size are chosen from these results. **Decision point:** if live detection is not good enough at any practical height and marker size, phase F7 is done.
-- **E10 Injection timing:** distribution of `t_capture − inject_wall` for the drone camera, and V18. *Accept:* the frame matching of 10.2 step 3 is unambiguous (spread well below 33 ms).
+- **E10 Injection timing (F4):** distribution of `t_capture − inject_wall` for the drone camera, and V18. *Accept:* the frame matching of 10.2 step 3 is unambiguous (spread well below 33 ms), or F4 decides that step 3 is not needed. `drone_logger` writes the injection times from F3 on (`injected_frames.csv`).
 
 ---
 
@@ -600,8 +609,8 @@ Prerequisites outside the code:
 | F0 | Plan, decisions, this document | done |
 | F1 | Android project from the sample, registration, connection, Compose UI with pilot view, screen kept on. `ssl-aggregator` added as a submodule | Stable connection; V11 |
 | F2 | Stream listener + phone recording (user start/stop, 7.10) with per-callback metadata and SEI | E1, E2 |
-| F3 | NAL parser, RTP packetizer + extension, unicast sender, "Live streaming" toggle. `drone_logger` video path: unicast receiver in `libcommon`, frame assembly, pipeline with `.mkv`, **v4l2loopback injection**, display, optional packet CSV. SSL-Vision reading the virtual camera. `docs/protocol.md` | E4, E10, V19 |
-| F4 | Telemetry, events, clock beacons. `drone_logger`: schema `drone`, batch writers, configuration check. `vision_logger`: `t_capture_camera`, `capture_session`, `source`. Grafana panels, `export.sh`. Analysis: beacon fit and live-frame correction (10.2) | E7 |
+| F3 | NAL parser, RTP packetizer + extension, unicast sender, "Live streaming" toggle. `drone_logger` video path: unicast receiver in `libcommon`, frame assembly, pipeline with `.mkv`, **v4l2loopback injection**, display, optional packet CSV. SSL-Vision reading the virtual camera. `docs/protocol.md`. Low-latency Wi-Fi lock | E4, V19 |
+| F4 | Telemetry, events, clock beacons. `drone_logger`: schema `drone`, batch writers, configuration check. `vision_logger`: `t_capture_camera`, `capture_session`, `source`. Grafana panels, `export.sh`. Analysis: beacon fit and live-frame correction (10.2), including the decision on step 3 | E7, E10 |
 | F5 | Drone configuration state machine (O3 band, H.265, 4K/60, exposure, WB, colour, subtitles), recording, gimbal | E3 |
 | F6 | Foreground service, locks, network callbacks, reconnection, final UI | E5, E6, E9, then E8 |
 | F7 (conditional) | Only if E9 shows that live detection is not good enough: 4K replay workflow (9.2) and its time map (10.3) | E8 with replay |

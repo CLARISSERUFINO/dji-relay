@@ -327,10 +327,12 @@ reads it like a webcam.
 2. Load it with a fixed device number (10) and a name:
 
    ```bash
-   sudo modprobe v4l2loopback video_nr=10 card_label="DJI drone" exclusive_caps=1
+   sudo modprobe v4l2loopback video_nr=10 card_label="DJI drone" exclusive_caps=1 max_buffers=4
    ```
 
-   `exclusive_caps=1` makes the device behave like a real camera towards readers, which some programs need.
+   `exclusive_caps=1` makes the device behave like a real camera towards readers, which some programs need. With it, the device presents itself as a camera only while a writer (`drone_logger`) is active, so start the capture in SSL-Vision after the video is flowing.
+
+   `max_buffers=4` is required: SSL-Vision's V4L module asks for 3 buffers, and with the default of 2 it fails with `REQBUFS returned error, count 2`. To change the options of a loaded module, close every program using `/dev/video10` (`fuser /dev/video10` lists them), then run `sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback` after editing the file of step 3; `cat /sys/module/v4l2loopback/parameters/max_buffers` shows the value in use.
 
 3. Load it on every boot with the same options. Create `/etc/modules-load.d/v4l2loopback.conf` with the single line:
 
@@ -341,7 +343,7 @@ reads it like a webcam.
    and `/etc/modprobe.d/v4l2loopback.conf` with the line:
 
    ```
-   options v4l2loopback video_nr=10 card_label="DJI drone" exclusive_caps=1
+   options v4l2loopback video_nr=10 card_label="DJI drone" exclusive_caps=1 max_buffers=4
    ```
 
 4. Check that `/dev/video10` appears with the name "DJI drone":
@@ -350,10 +352,10 @@ reads it like a webcam.
    v4l2-ctl --list-devices
    ```
 
-5. Test it end to end with two terminals. In the first, write a 1920×1080 YUYV test pattern into the device (the same format `drone_logger` will use):
+5. Test it end to end with two terminals. In the first, write a YUYV test pattern into the device, at the live stream's resolution (1440×1080 measured in F2). v4l2loopback 0.12 needs the caps to state progressive and colorimetry `2:4:7:1`; `videotestsrc` negotiates them by itself:
 
    ```bash
-   gst-launch-1.0 videotestsrc ! video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1 ! v4l2sink device=/dev/video10
+   gst-launch-1.0 videotestsrc ! video/x-raw,format=YUY2,width=1440,height=1080,framerate=30/1 ! v4l2sink device=/dev/video10
    ```
 
    In the second, read it back. A window with the test pattern should open:

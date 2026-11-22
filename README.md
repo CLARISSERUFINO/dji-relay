@@ -47,6 +47,7 @@ git submodule update --init --recursive
 ## Documentation
 
 - [Specification](docs/specification.md): requirements, architecture, protocol outline, tests and phases.
+- [Phone → PC protocol](docs/protocol.md): RTP/H.264 live video and its header extension.
 - [Development environment setup](docs/dev-environment.md): Ubuntu, Android Studio, the C++ toolchain, GStreamer, the phone, and Claude Code.
 - [CLAUDE.md](CLAUDE.md): working rules for Claude Code in this repository.
 - [.env.example](.env.example): the `DRONE_*` configuration keys for `drone_logger`, to be added to `ssl-aggregator`'s `.env`.
